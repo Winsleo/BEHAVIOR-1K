@@ -727,7 +727,13 @@ def torch_compile(func):
         return th.jit.script(func)
     # Otherwise, return a torch.compile option
     else:
-        return th.compile(func)
+        # fix compile error
+        # ValueError: too many values to unpack (expected 0)
+        try:
+            return th.compile(func)
+        except Exception as e:
+            print(f"Warning: torch.compile failed with error: {e}. Returning original function.")
+            return func
 
 
 def nums2array(nums, dim, dtype=th.float32):
