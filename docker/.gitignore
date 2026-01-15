@@ -1,0 +1,6 @@
+# Data directories (user-specific, should not be committed)
+data/
+*.log
+
+# Docker override files
+docker-compose.override.yml
