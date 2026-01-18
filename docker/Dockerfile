@@ -47,7 +47,13 @@ RUN wget --no-verbose -O /cuda-keyring.deb https://developer.download.nvidia.com
     micromamba run -n behavior pip install \
     git+https://github.com/StanfordVL/curobo@cbaf7d32436160956dad190a9465360fad6aba73#egg=nvidia_curobo \
     --no-build-isolation > /dev/null && \
-  apt-get remove -y cuda-toolkit-11-8 && apt-get autoremove -y && apt-get autoclean -y && rm -rf /var/lib/apt/lists/*
+  rm -rf /var/lib/apt/lists/*
+
+# Set CUDA environment variables for runtime JIT compilation (if needed)
+# Use /usr/local/cuda symlink to avoid hardcoding version
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 # Make sure isaac gets properly sourced every time behavior gets called
 ARG CONDA_ACT_FILE="/micromamba/envs/behavior/etc/conda/activate.d/env_vars.sh"
