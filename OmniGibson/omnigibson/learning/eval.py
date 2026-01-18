@@ -73,6 +73,11 @@ class Evaluator:
     and handling video outputs and loggings.
     """
 
+    # Third-person camera configuration (can be adjusted)
+    THIRD_PERSON_CAM_DISTANCE = 3.0  # Distance behind the robot (meters)
+    THIRD_PERSON_CAM_HEIGHT = 2.0    # Height above the robot (meters)
+    THIRD_PERSON_CAM_PITCH = 25.0    # Pitch angle in degrees (looking down at robot)
+
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
 
@@ -86,6 +91,9 @@ class Evaluator:
         self.policy = self.load_policy()
         self.robot = self.load_robot()
         self.metrics = self.load_metrics()
+
+        # Third-person camera follow settings
+        self._follow_robot_camera = getattr(cfg, 'follow_robot_camera', True)
 
         self.reset()
         # manually reset environment episode number
@@ -202,7 +210,8 @@ class Evaluator:
                updates the count of successful trials if the task was completed successfully.
             4. Preprocesses the new observation.
             5. Invokes step callbacks for all registered metrics to update their state.
-            6. Returns the termination and truncation status.
+            6. Updates the third-person camera to follow the robot.
+            7. Returns the termination and truncation status.
         """
         self.robot_action = self.policy.forward(obs=self.obs)
 
@@ -218,6 +227,10 @@ class Evaluator:
 
         for metric in self.metrics:
             metric.step_callback(self.env)
+
+        # Update third-person camera to follow the robot
+        self._update_third_person_camera()
+
         return terminated, truncated
 
     @property
@@ -349,6 +362,73 @@ class Evaluator:
             mode="rgb",
         )
 
+    def _update_third_person_camera(self) -> None:
+        """
+        Update the viewer camera to follow the robot from a third-person perspective.
+        The camera is positioned behind and above the robot, always looking at the robot.
+        """
+        # Skip camera updates in headless mode to avoid unnecessary computation
+        if gm.HEADLESS or not self._follow_robot_camera or og.sim.viewer_camera is None:
+            return
+
+        # Get robot position and orientation
+        robot_pos, robot_quat = self.robot.get_position_orientation()
+
+        # Get robot's forward direction from its orientation (robot faces +X in local frame)
+        robot_rot_mat = T.quat2mat(robot_quat)
+        robot_forward = robot_rot_mat[:, 0]  # First column is the local +X (forward) direction
+
+        # Compute camera position: behind and above the robot
+        # Camera is positioned at: robot_pos - forward * distance + up * height
+        cam_distance = self.THIRD_PERSON_CAM_DISTANCE
+        cam_height = self.THIRD_PERSON_CAM_HEIGHT
+
+        cam_pos = robot_pos.clone()
+        cam_pos[0] -= robot_forward[0] * cam_distance
+        cam_pos[1] -= robot_forward[1] * cam_distance
+        cam_pos[2] += cam_height
+
+        # Compute camera orientation to look at the robot
+        # Direction from camera to robot
+        look_dir = robot_pos - cam_pos
+        look_dir[2] += 0.8  # Look at a point slightly above robot base (roughly torso height)
+        look_dir = look_dir / th.norm(look_dir)
+
+        # Compute camera orientation using look_at logic
+        # In Isaac Sim/OmniGibson, camera typically looks along -Z axis
+        # We need to rotate so that -Z points towards the robot
+
+        # Create rotation matrix where:
+        # -Z axis points towards target (look_dir)
+        # Y axis points up (as much as possible)
+        up = th.tensor([0.0, 0.0, 1.0], dtype=look_dir.dtype, device=look_dir.device)
+
+        # Forward direction (will be -Z for camera)
+        forward = look_dir
+
+        # Right direction = forward x up (normalized)
+        right = th.cross(forward, up)
+        right_norm = th.norm(right)
+        if right_norm < 1e-6:
+            # forward is parallel to up, use a different up vector
+            up = th.tensor([0.0, 1.0, 0.0], dtype=look_dir.dtype, device=look_dir.device)
+            right = th.cross(forward, up)
+        right = right / th.norm(right)
+
+        # Recompute up to be orthogonal
+        up = th.cross(right, forward)
+        up = up / th.norm(up)
+
+        # Build rotation matrix (column vectors: right, up, -forward for camera convention)
+        # Camera in OmniGibson: +X right, +Y up, -Z forward
+        rot_mat = th.stack([right, up, -forward], dim=1)
+
+        # Convert to quaternion
+        cam_quat = T.mat2quat(rot_mat)
+
+        # Set the viewer camera position and orientation
+        og.sim.viewer_camera.set_position_orientation(position=cam_pos, orientation=cam_quat)
+
     def reset(self) -> None:
         """
         Reset the environment, policy, and compute metrics.
@@ -359,6 +439,8 @@ class Evaluator:
             metric.start_callback(self.env)
         self.policy.reset()
         self.n_success_trials, self.n_trials = 0, 0
+        # Update third-person camera to follow the robot after reset
+        self._update_third_person_camera()
 
     def __enter__(self):
         signal(SIGINT, self._sigint_handler)
