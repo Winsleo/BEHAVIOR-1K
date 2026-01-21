@@ -88,7 +88,7 @@ mkdir -p "$DATA_PATH"/isaac-sim/{cache/{kit,ov,pip,glcache,computecache},logs,co
 # Set up X11 forwarding for GUI mode
 if [ "$GUI" = true ] ; then
     echo -e "${BGreen}Setting up X11 forwarding...${Color_Off}"
-    xhost +local: 2>/dev/null || echo "Warning: Could not set xhost permissions."
+    xhost +: 2>/dev/null || echo "Warning: Could not set xhost permissions."
 fi
 
 cd "$SCRIPT_DIR"
@@ -134,5 +134,5 @@ docker compose $PROFILE exec $SERVICE /bin/bash
 
 # Cleanup X11
 if [ "$GUI" = true ] ; then
-    xhost -local: 2>/dev/null || true
+    xhost -: 2>/dev/null || true
 fi

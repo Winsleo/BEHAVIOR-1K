@@ -9,7 +9,6 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
-        DEV_MODE: "0"
         INSTALL_EXTRAS: "eval,primitives"
         JOYLO_INSTALL: "false"
     image: behavior-1k:latest
@@ -21,8 +20,6 @@ services:
       - OMNIGIBSON_DATA_PATH=/BEHAVIOR-1K/datasets
       - OMNI_KIT_ACCEPT_EULA=YES
       - OMNIGIBSON_HEADLESS=${OMNIGIBSON_HEADLESS:-0}
-      # CUDA environment for curobo JIT compilation
-      - CUDA_HOME=/usr/local/cuda
     volumes:
       - ../:/BEHAVIOR-1K:rw
       - ${DATA_PATH:-./data}/isaac-sim/cache/kit:/isaac-sim/kit/cache/Kit:rw
@@ -54,7 +51,6 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
-        DEV_MODE: "0"
         INSTALL_EXTRAS: "eval,primitives"
         JOYLO_INSTALL: "true"
     image: behavior-1k:joylo
@@ -66,8 +62,6 @@ services:
       - OMNIGIBSON_DATA_PATH=/BEHAVIOR-1K/datasets
       - OMNI_KIT_ACCEPT_EULA=YES
       - OMNIGIBSON_HEADLESS=${OMNIGIBSON_HEADLESS:-0}
-      # CUDA environment for curobo JIT compilation
-      - CUDA_HOME=/usr/local/cuda
     volumes:
       - ../:/BEHAVIOR-1K:rw
       - ${DATA_PATH:-./data}/isaac-sim/cache/kit:/isaac-sim/kit/cache/Kit:rw
