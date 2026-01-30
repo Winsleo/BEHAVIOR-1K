@@ -142,7 +142,7 @@ def navigate_and_grasp(
         obj=obj,
         max_samples=max_samples,
         verbose=verbose,
-        visualize_failures=visualize,
+        visualize=visualize,
     )
 
     if not sample_result.success:
@@ -156,12 +156,6 @@ def navigate_and_grasp(
 
     # Visualize sampling region and sampled pose
     if visualize:
-        visualize_sampling_region(
-            obj=obj,
-            eef_pose=pregrasp_pose,
-            radius=DEFAULT_SAMPLING_RADIUS,
-            verbose=verbose,
-        )
         visualize_robot_and_sampled_pose(
             robot=robot,
             sampled_pose=base_pose_2d,
@@ -245,7 +239,8 @@ def sample_pose_near_object(
     max_samples: int = DEFAULT_MAX_SAMPLES,
     sampling_radius: float = DEFAULT_SAMPLING_RADIUS,
     verbose: bool = True,
-    visualize_failures: bool = False,
+    visualize: bool = False,
+    seed: int = 42,
 ) -> SampledPoseResult:
     """
     Sample a valid 2D base pose near an object for grasping.
@@ -255,17 +250,23 @@ def sample_pose_near_object(
     - The target object is reachable by the robot arm
     - The position is in the same room as the object
 
+    Uses batch collision checking for efficiency.
+
     Args:
         controller: StarterSemanticActionPrimitives instance.
         obj: Target object.
         max_samples: Maximum number of sampling attempts.
         sampling_radius: Maximum distance from object to sample.
         verbose: Whether to print progress information.
-        visualize_failures: Whether to visualize failed poses.
+        visualize: Whether to visualize failed poses.
+        seed: Random seed for reproducibility.
 
     Returns:
         SampledPoseResult containing pose information and statistics.
     """
+    # Set random seed for reproducibility
+    th.manual_seed(seed)
+
     robot = controller.robot
     arm = controller.arm
 
@@ -283,6 +284,13 @@ def sample_pose_near_object(
 
     try:
         eef_pose, grasp_pose = controller._sample_grasp_pose(obj)
+        if visualize:
+            visualize_sampling_region(
+                obj=obj,
+                eef_pose=eef_pose,
+                radius=DEFAULT_SAMPLING_RADIUS,
+                verbose=verbose,
+            )
         if verbose:
             print(f"  Pre-grasp position: {eef_pose[0].tolist()}")
             print(f"  Grasp position: {grasp_pose[0].tolist()}")
@@ -319,81 +327,145 @@ def sample_pose_near_object(
     # Update obstacles before sampling
     controller._motion_generator.update_obstacles()
 
-    # Collect failed poses for visualization
-    collision_failed_poses = []
-    reachability_failed_poses = []
+    # ========================================================================
+    # Batch generation of all candidate 2D poses
+    # ========================================================================
+    if verbose:
+        print(f"  Generating {max_samples} candidate poses...")
 
+    # Generate all random samples at once
+    distances = th.rand(max_samples) * (distance_hi - distance_lo) + distance_lo
+    yaws = th.rand(max_samples) * (yaw_hi - yaw_lo) + yaw_lo
+
+    # Compute all candidate 2D poses: (max_samples, 3) -> [x, y, yaw]
+    candidate_2d_poses = th.stack([
+        target_pose[0][0] + distances * th.cos(yaws),
+        target_pose[0][1] + distances * th.sin(yaws),
+        yaws + math.pi - avg_arm_workspace_range,
+    ], dim=1)  # Shape: (max_samples, 3)
+
+    # ========================================================================
+    # Room filter (must be done per-sample due to map query)
+    # ========================================================================
+    room_valid_mask = th.zeros(max_samples, dtype=th.bool)
     for i in range(max_samples):
-        stats["total_attempts"] = i + 1
+        candidate_room = robot.scene._seg_map.get_room_instance_by_point(candidate_2d_poses[i, :2])
+        room_valid_mask[i] = candidate_room in obj_rooms
 
-        # Sample candidate 2D pose
-        distance = (th.rand(1) * (distance_hi - distance_lo) + distance_lo).item()
-        yaw = th.rand(1) * (yaw_hi - yaw_lo) + yaw_lo
-        candidate_2d_pose = th.cat([
-            target_pose[0][0:1] + distance * th.cos(yaw),
-            target_pose[0][1:2] + distance * th.sin(yaw),
-            yaw + math.pi - avg_arm_workspace_range,
-        ])
+    room_valid_indices = th.where(room_valid_mask)[0]
+    stats["room_failures"] = max_samples - len(room_valid_indices)
 
-        # Check if candidate is in the same room as object
-        candidate_room = robot.scene._seg_map.get_room_instance_by_point(candidate_2d_pose[:2])
-        if candidate_room not in obj_rooms:
-            stats["room_failures"] += 1
-            continue
+    if verbose:
+        print(f"  Room filter: {len(room_valid_indices)}/{max_samples} passed")
 
-        # Check collision
-        current_joint_pos = robot.get_joint_positions()
-        joint_pos = current_joint_pos.clone()
-        joint_pos[robot.base_control_idx] = candidate_2d_pose
-        candidate_joint_positions = joint_pos.unsqueeze(0)
-
-        obj_in_hand = controller._get_obj_in_hand()
-        attached_obj = (
-            {robot.eef_link_names[arm]: obj_in_hand.root_link}
-            if obj_in_hand else None
-        )
-
-        collision_result = controller._motion_generator.check_collisions(
-            candidate_joint_positions,
-            self_collision_check=False,
-            skip_obstacle_update=True,
-            attached_obj=attached_obj,
-        ).cpu()
-
-        if collision_result[0].item():
-            stats["collision_failures"] += 1
-            collision_failed_poses.append(candidate_2d_pose.clone())
-            if verbose and i < MAX_VERBOSE_SAMPLES:
-                print(f"  Sample {i}: Collision at ({candidate_2d_pose[0].item():.2f}, {candidate_2d_pose[1].item():.2f})")
-            continue
-
-        # Check reachability
-        if not controller._target_in_reach_of_robot(
-            target_pose, initial_joint_pos=joint_pos, skip_obstacle_update=True
-        ):
-            stats["reachability_failures"] += 1
-            reachability_failed_poses.append(candidate_2d_pose.clone())
-            if verbose and i < MAX_VERBOSE_SAMPLES:
-                print(f"  Sample {i}: Not reachable at ({candidate_2d_pose[0].item():.2f}, {candidate_2d_pose[1].item():.2f})")
-            continue
-
-        # Success!
+    if len(room_valid_indices) == 0:
         if verbose:
-            print(f"\n  [SUCCESS] Found valid pose after {i + 1} attempts")
-            print(f"    Collision failures: {stats['collision_failures']}")
-            print(f"    Reachability failures: {stats['reachability_failures']}")
-            print(f"    Room failures: {stats['room_failures']}")
-            print(f"    Valid pose: ({candidate_2d_pose[0].item():.3f}, {candidate_2d_pose[1].item():.3f}, {candidate_2d_pose[2].item():.3f})")
-
+            print(f"\n  [FAILED] All samples failed room check")
         return SampledPoseResult(
-            pregrasp_pose=eef_pose,
-            grasp_pose=grasp_pose,
-            base_pose_2d=candidate_2d_pose,
-            success=True,
+            pregrasp_pose=None,
+            grasp_pose=None,
+            base_pose_2d=None,
+            success=False,
             stats=stats,
         )
 
+    # ========================================================================
+    # Batch collision check
+    # ========================================================================
+    current_joint_pos = robot.get_joint_positions()
+    room_valid_poses = candidate_2d_poses[room_valid_indices]  # (N_valid, 3)
+
+    # Build batch joint positions
+    batch_joint_positions = current_joint_pos.unsqueeze(0).repeat(len(room_valid_indices), 1)
+    batch_joint_positions[:, robot.base_control_idx] = room_valid_poses
+
+    obj_in_hand = controller._get_obj_in_hand()
+    attached_obj = (
+        {robot.eef_link_names[arm]: obj_in_hand.root_link}
+        if obj_in_hand else None
+    )
+
+    if verbose:
+        print(f"  Running batch collision check for {len(room_valid_indices)} candidates...")
+
+    collision_results = controller._motion_generator.check_collisions(
+        batch_joint_positions,
+        self_collision_check=False,
+        skip_obstacle_update=True,
+        attached_obj=attached_obj,
+    ).cpu()  # Shape: (N_valid,)
+
+    collision_free_mask = ~collision_results
+    collision_free_local_indices = th.where(collision_free_mask)[0]
+    stats["collision_failures"] = int(collision_results.sum().item())
+
+    if verbose:
+        print(f"  Collision filter: {len(collision_free_local_indices)}/{len(room_valid_indices)} passed")
+
+    # Collect collision failed poses for visualization
+    collision_failed_poses = [
+        room_valid_poses[i].clone()
+        for i in range(len(room_valid_poses))
+        if collision_results[i].item()
+    ]
+
+    if len(collision_free_local_indices) == 0:
+        stats["total_attempts"] = max_samples
+        if verbose:
+            print(f"\n  [FAILED] All samples failed collision check")
+            print(f"    Collision failures: {stats['collision_failures']}")
+            print(f"    Room failures: {stats['room_failures']}")
+        if visualize:
+            _visualize_failed_poses(robot, collision_failed_poses, [], max_display=MAX_VERBOSE_SAMPLES)
+        return SampledPoseResult(
+            pregrasp_pose=None,
+            grasp_pose=None,
+            base_pose_2d=None,
+            success=False,
+            stats=stats,
+        )
+
+    # ========================================================================
+    # Reachability check (sequential, as IK solving is typically not batched)
+    # ========================================================================
+    reachability_failed_poses = []
+
+    if verbose:
+        print(f"  Checking reachability for {len(collision_free_local_indices)} collision-free candidates...")
+
+    for local_idx in collision_free_local_indices:
+        candidate_2d_pose = room_valid_poses[local_idx]
+        joint_pos = batch_joint_positions[local_idx]
+
+        if controller._target_in_reach_of_robot(
+            target_pose, initial_joint_pos=joint_pos, skip_obstacle_update=True
+        ):
+            # Success! Found a valid pose
+            global_idx = room_valid_indices[local_idx].item()
+            stats["total_attempts"] = global_idx + 1
+
+            if verbose:
+                print(f"\n  [SUCCESS] Found valid pose (sample {global_idx})")
+                print(f"    Collision failures: {stats['collision_failures']}")
+                print(f"    Reachability failures: {stats['reachability_failures']}")
+                print(f"    Room failures: {stats['room_failures']}")
+                print(f"    Valid pose: ({candidate_2d_pose[0].item():.3f}, {candidate_2d_pose[1].item():.3f}, {candidate_2d_pose[2].item():.3f})")
+
+            return SampledPoseResult(
+                pregrasp_pose=eef_pose,
+                grasp_pose=grasp_pose,
+                base_pose_2d=candidate_2d_pose,
+                success=True,
+                stats=stats,
+            )
+        else:
+            stats["reachability_failures"] += 1
+            reachability_failed_poses.append(candidate_2d_pose.clone())
+            if verbose and len(reachability_failed_poses) <= MAX_VERBOSE_SAMPLES:
+                print(f"    Sample {room_valid_indices[local_idx].item()}: Not reachable at ({candidate_2d_pose[0].item():.2f}, {candidate_2d_pose[1].item():.2f})")
+
     # Sampling failed
+    stats["total_attempts"] = max_samples
     if verbose:
         print(f"\n  [FAILED] No valid pose found after {max_samples} attempts")
         print(f"    Collision failures: {stats['collision_failures']}")
@@ -401,8 +473,8 @@ def sample_pose_near_object(
         print(f"    Room failures: {stats['room_failures']}")
 
     # Visualize failed poses if requested
-    if visualize_failures:
-        _visualize_failed_poses(robot, collision_failed_poses, reachability_failed_poses)
+    if visualize:
+        _visualize_failed_poses(robot, collision_failed_poses, reachability_failed_poses, max_display=MAX_VERBOSE_SAMPLES)
 
     return SampledPoseResult(
         pregrasp_pose=None,
