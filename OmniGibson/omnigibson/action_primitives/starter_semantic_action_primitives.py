@@ -1043,7 +1043,9 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
 
                     max_base_pos_diff = th.max(th.abs(base_joint_diff[:2])).item()
                     max_base_orn_diff = th.abs(wrap_angle(base_joint_diff[2]))
-                    if max_base_pos_diff < m.DEFAULT_DIST_THRESHOLD and max_base_orn_diff < m.DEFAULT_ANGLE_THRESHOLD:
+                    base_dist_threshold = m.DEFAULT_DIST_THRESHOLD if not low_precision else m.LOW_PRECISION_DIST_THRESHOLD
+                    base_angle_threshold = m.DEFAULT_ANGLE_THRESHOLD if not low_precision else m.LOW_PRECISION_ANGLE_THRESHOLD  
+                    if max_base_pos_diff < base_dist_threshold and max_base_orn_diff < base_angle_threshold:
                         base_target_reached = True
 
                     # Early stopping if the base, trunk and arm joints are at the target positions

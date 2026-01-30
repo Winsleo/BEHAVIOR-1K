@@ -75,7 +75,7 @@ robots:
     controller_config:
       base:
         name: HolonomicBaseJointController
-        motor_type: position
+        motor_type: velocity # Changed from position to velocity for direct navigation
         command_input_limits: null
         use_impedances: false
       trunk:

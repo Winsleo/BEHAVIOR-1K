@@ -22,7 +22,7 @@ th.backends.cudnn.allow_tf32 = True
 # Create settings for this module
 m = create_module_macros(module_path=__file__)
 
-m.HOLONOMIC_BASE_PRISMATIC_JOINT_LIMIT = 5.0  # meters
+m.HOLONOMIC_BASE_PRISMATIC_JOINT_LIMIT = 10.0  # meters
 m.HOLONOMIC_BASE_REVOLUTE_JOINT_LIMIT = math.pi * 2  # radians
 
 m.DEFAULT_COLLISION_ACTIVATION_DISTANCE = 0.005
