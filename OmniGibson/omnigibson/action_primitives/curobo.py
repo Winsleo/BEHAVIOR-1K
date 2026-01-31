@@ -169,12 +169,12 @@ class CuRoboMotionGenerator:
                 use_cuda_graph=use_cuda_graph,
                 num_ik_seeds=128,
                 num_batch_ik_seeds=128,
-                num_batch_trajopt_seeds=1,
-                num_trajopt_noisy_seeds=1,
+                num_batch_trajopt_seeds=8,
+                num_trajopt_noisy_seeds=8,
                 ik_opt_iters=100,
                 optimize_dt=True,
-                num_trajopt_seeds=4,
-                num_graph_seeds=4,
+                num_trajopt_seeds=8,
+                num_graph_seeds=1,  # Must be 1 for batch mode graph search to work
                 interpolation_dt=og.sim.get_sim_step_dt(),
                 collision_activation_distance=collision_activation_distance,
                 self_collision_check=True,
@@ -522,6 +522,7 @@ class CuRoboMotionGenerator:
         ik_only=False,
         ik_world_collision_check=True,
         emb_sel=CuRoboEmbodimentSelection.DEFAULT,
+        enable_graph=False,
     ):
         """
         Computes the robot joint trajectory to reach the desired @target_pos and @target_quat
@@ -618,6 +619,13 @@ class CuRoboMotionGenerator:
                 target_pose = inv_robot_pose.view(1, 4, 4) @ target_pose
                 target_pos_link = target_pose[:, :3, 3]
                 target_quat_link = T.mat2quat(target_pose[:, :3, :3])
+                
+                # For base navigation (BASE embodiment), ensure Z coordinate is reasonable
+                # to avoid false collision detection with ground
+                if emb_sel == CuRoboEmbodimentSelection.BASE:
+                    ee_link_pos, _ = self.robot.links[self.ee_link[emb_sel]].get_position_orientation()
+                    relative_z = ee_link_pos[2] - robot_pos[2]
+                    target_pos_link[:, 2] = relative_z
 
             # Map xyzw -> wxyz quat
             target_quat_link = target_quat_link[:, [3, 0, 1, 2]]
@@ -631,10 +639,10 @@ class CuRoboMotionGenerator:
 
         # Define the plan config
         plan_cfg = lazy.curobo.wrap.reacher.motion_gen.MotionGenPlanConfig(
-            enable_graph=False,
+            enable_graph=enable_graph,
             max_attempts=max_attempts,
             timeout=timeout,
-            enable_graph_attempt=None,
+            enable_graph_attempt=2 if enable_graph else None,  # Try graph search after 2 failed attempts
             ik_fail_return=ik_fail_return,
             enable_finetune_trajopt=enable_finetune_trajopt,
             finetune_attempts=finetune_attempts,

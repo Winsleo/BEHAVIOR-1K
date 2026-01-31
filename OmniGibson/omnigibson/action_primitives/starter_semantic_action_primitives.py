@@ -85,7 +85,7 @@ m.KP_ANGLE_VEL = {
     R1Pro: 0.2,
 }
 
-m.DEFAULT_COLLISION_ACTIVATION_DISTANCE = 0.02
+m.DEFAULT_COLLISION_ACTIVATION_DISTANCE = 0.03
 m.MAX_PLANNING_ATTEMPTS = 100
 m.MAX_IK_FAILURES_BEFORE_RETURN = 50
 
@@ -115,8 +115,8 @@ m.OPEN_GRASP_APPROACH_DISTANCE = 0.4
 m.HAND_DIST_THRESHOLD = 0.002
 m.DEFAULT_DIST_THRESHOLD = 0.005
 m.DEFAULT_ANGLE_THRESHOLD = 0.03
-m.LOW_PRECISION_DIST_THRESHOLD = 0.1
-m.LOW_PRECISION_ANGLE_THRESHOLD = 0.2
+m.LOW_PRECISION_DIST_THRESHOLD = 0.05
+m.LOW_PRECISION_ANGLE_THRESHOLD = 0.1
 
 m.JOINT_POS_DIFF_THRESHOLD = 0.005
 m.LOW_PRECISION_JOINT_POS_DIFF_THRESHOLD = 0.05
@@ -159,9 +159,10 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
         enable_head_tracking=True,
         always_track_eef=False,
         task_relevant_objects_only=False,
-        curobo_batch_size=3,
+        curobo_batch_size=1,
         debug_visual_marker=None,
         skip_curobo_initilization=False,
+        use_cuda_graph=True,
     ):
         """
         Initializes a StarterSemanticActionPrimitives generator.
@@ -177,6 +178,8 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
             curobo_batch_size (int): The batch size for curobo motion planning and collision checking. Defaults to 3.
             debug_visual_marker (PrimitiveObject): The object to use for debug visual markers. Defaults to None.
             skip_curobo_initilization (bool): Whether to skip curobo initialization. Defaults to False.
+            use_cuda_graph (bool): Whether to use CUDA graph for motion generation. Defaults to True.
+                Set to True for lower memory usage, but this disables graph search for navigation around obstacles.
         """
         log.warning(
             "The StarterSemanticActionPrimitive is a work-in-progress and is only provided as an example. "
@@ -201,6 +204,7 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
                 robot=self.robot,
                 batch_size=curobo_batch_size,
                 collision_activation_distance=m.DEFAULT_COLLISION_ACTIVATION_DISTANCE,
+                use_cuda_graph=use_cuda_graph,
             )
         )
 
@@ -943,6 +947,8 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
         motion_constraint=None,
         skip_obstacle_update=False,
         ignore_objects=None,
+        enable_graph=False,
+        verbose=False,
     ):
         # If an object is grasped, we need to pass it to the motion planner
         obj_in_hand = self._get_obj_in_hand()
@@ -957,7 +963,7 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
         if not skip_obstacle_update:
             self._motion_generator.update_obstacles(ignore_objects=ignore_objects)
 
-        successes, traj_paths = self._motion_generator.compute_trajectories(
+        results = self._motion_generator.compute_trajectories(
             target_pos=target_pos,
             target_quat=target_quat,
             initial_joint_pos=None,
@@ -967,7 +973,7 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
             ik_fail_return=m.MAX_IK_FAILURES_BEFORE_RETURN,
             enable_finetune_trajopt=True,
             finetune_attempts=1,
-            return_full_result=False,
+            return_full_result=True,
             success_ratio=1.0 / self._motion_generator.batch_size,
             attached_obj=attached_obj,
             attached_obj_scale=None,
@@ -976,15 +982,33 @@ class StarterSemanticActionPrimitives(BaseActionPrimitiveSet):
             ik_only=False,
             ik_world_collision_check=True,
             emb_sel=embodiment_selection,
+            enable_graph=enable_graph,
         )
+        
+        # Extract successes and paths from full results
+        successes = th.cat([r.success for r in results])
+        traj_paths = []
+        for r in results:
+            if r.interpolated_plan is not None:
+                traj_paths.extend(r.get_paths())
+            else:
+                traj_paths.extend([None] * r.success.shape[0])
+        
         # Grab the first successful trajectory if found
         success_idx = th.where(successes)[0].cpu()
         if len(success_idx) == 0:
-            # print("motion planning fails")
-            # breakpoint()
+            error_msg = "There is no accessible path from where you are to the desired pose."
+            if verbose:
+                # Collect detailed failure info from CuRobo result
+                failure_reasons = []
+                for i, r in enumerate(results):
+                    status_str = str(r.status).replace("MotionGenStatus.", "")
+                    failure_reasons.append(f"Batch {i}: {status_str}")
+                failure_info = "; ".join(failure_reasons)
+                error_msg += f" Failure reasons: [{failure_info}]"
             raise ActionPrimitiveError(
                 ActionPrimitiveError.Reason.PLANNING_ERROR,
-                "There is no accessible path from where you are to the desired pose. Try again",
+                error_msg,
             )
 
         traj_path = traj_paths[success_idx[0]]

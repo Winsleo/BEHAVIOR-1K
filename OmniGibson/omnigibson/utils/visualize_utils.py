@@ -96,7 +96,12 @@ def visualize_robot_spheres(
     # Visualize spheres using blue boxes
     if spheres and len(spheres[0]) > 0:
         for sphere in spheres[0]:
-            center = sphere.pose[:3].cpu().numpy()
+            pose = sphere.pose[:3]
+            # Handle both tensor and list types
+            if isinstance(pose, th.Tensor):
+                center = pose.cpu().numpy()
+            else:
+                center = np.array(pose)
             radius = _to_scalar(sphere.radius)
 
             # Approximate sphere with a box
@@ -150,7 +155,12 @@ def visualize_robot_spheres_at_config(
     # Visualize spheres
     if spheres and len(spheres[0]) > 0:
         for sphere in spheres[0]:
-            center = sphere.pose[:3].cpu().numpy()
+            pose = sphere.pose[:3]
+            # Handle both tensor and list types
+            if isinstance(pose, th.Tensor):
+                center = pose.cpu().numpy()
+            else:
+                center = np.array(pose)
             radius = _to_scalar(sphere.radius)
 
             draw_box(
@@ -162,7 +172,15 @@ def visualize_robot_spheres_at_config(
 
         if verbose:
             # Print bounding box info
-            all_centers = th.stack([s.pose[:3] for s in spheres[0]])
+            # Handle both tensor and list types for pose
+            centers_list = []
+            for s in spheres[0]:
+                p = s.pose[:3]
+                if isinstance(p, th.Tensor):
+                    centers_list.append(p)
+                else:
+                    centers_list.append(th.tensor(p))
+            all_centers = th.stack(centers_list)
             min_bound = all_centers.min(dim=0).values.cpu()
             max_bound = all_centers.max(dim=0).values.cpu()
             print(f"Bounding box: ({min_bound[0]:.2f}, {min_bound[1]:.2f}, {min_bound[2]:.2f}) to ({max_bound[0]:.2f}, {max_bound[1]:.2f}, {max_bound[2]:.2f})")
@@ -426,11 +444,22 @@ def visualize_trajectory(
     base_idx = robot.base_control_idx
 
     # Extract base positions (x, y) from trajectory
-    # base_idx typically contains indices for [x, y, z, roll, pitch, yaw]
-    positions = [
-        (q[base_idx[0]].item(), q[base_idx[1]].item(), z_height)
-        for q in q_traj
-    ]
+    # For HolonomicBaseRobot, joint values are relative to root_link, need to convert to world coordinates
+    from omnigibson.robots.holonomic_base_robot import HolonomicBaseRobot
+    positions = []
+    for q in q_traj:
+        joint_x = q[base_idx[0]].item()
+        joint_y = q[base_idx[1]].item()
+        
+        if isinstance(robot, HolonomicBaseRobot):
+            # Convert joint values to world coordinates
+            root_pos, root_quat = robot.root_link.get_position_orientation()
+            local_pos = th.tensor([joint_x, joint_y, 0.0])
+            local_quat = th.tensor([0.0, 0.0, 0.0, 1.0])
+            world_pos, _ = T.pose_transform(root_pos, root_quat, local_pos, local_quat)
+            positions.append((world_pos[0].item(), world_pos[1].item(), z_height))
+        else:
+            positions.append((joint_x, joint_y, z_height))
 
     # Draw trajectory lines
     for i in range(len(positions) - 1):

@@ -24,8 +24,10 @@ import yaml
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
+from omnigibson.action_primitives.action_primitive_set_base import ActionPrimitiveError
 from omnigibson.action_primitives.curobo import CuRoboEmbodimentSelection
 from omnigibson.action_primitives.starter_semantic_action_primitives import StarterSemanticActionPrimitives
+from omnigibson.robots.holonomic_base_robot import HolonomicBaseRobot
 from omnigibson.learning.utils.eval_utils import (
     TASK_NAMES_TO_INDICES,
     generate_basic_environment_config,
@@ -61,7 +63,7 @@ with macros.unlocked():
 
 # Constants
 NUM_EVAL_INSTANCES = 10
-DEFAULT_SAMPLING_RADIUS = 1.5
+DEFAULT_SAMPLING_RADIUS = 2.0
 DEFAULT_MAX_SAMPLES = 100
 DEFAULT_IMAGE_SIZE = 224
 MAX_VERBOSE_SAMPLES = 20
@@ -162,28 +164,31 @@ def navigate_and_grasp(
             sampled_pose=base_pose_2d,
             verbose=verbose,
         )
+        for _ in range(30):
+            og.sim.step()
 
     # Step 2: Plan navigation
     if verbose:
         print(f"\n{'='*50}")
         print(f"[Step 2/5] Planning navigation to target pose")
         print(f"{'='*50}")
-
+    
     q_traj = plan_navigation(
         controller=controller,
         robot=robot,
         target_pose_2d=base_pose_2d,
         verbose=verbose,
+        visualize=visualize,
     )
 
     if q_traj is None:
-        if verbose:
-            print(f"[FAILED] Navigation planning failed")
         return GraspResult.NAVIGATION_FAILED
 
     # Visualize planned trajectory
     if visualize and q_traj is not None:
         visualize_trajectory(q_traj=q_traj, robot=robot, verbose=verbose)
+        for _ in range(30):
+            og.sim.step()
 
     # Step 3: Execute navigation
     if verbose:
@@ -374,11 +379,37 @@ def sample_pose_near_object(
     # Batch collision check
     # ========================================================================
     current_joint_pos = robot.get_joint_positions()
-    room_valid_poses = candidate_2d_poses[room_valid_indices]  # (N_valid, 3)
+    room_valid_poses = candidate_2d_poses[room_valid_indices]  # (N_valid, 3) - world coordinates [x, y, yaw]
 
     # Build batch joint positions
     batch_joint_positions = current_joint_pos.unsqueeze(0).repeat(len(room_valid_indices), 1)
-    batch_joint_positions[:, robot.base_control_idx] = room_valid_poses
+    
+    # For HolonomicBaseRobot, we need to convert world coordinates to joint values
+    # Joint values are relative to root_link, not absolute world coordinates
+    if isinstance(robot, HolonomicBaseRobot):
+        # Get root_link's world position (this is fixed)
+        root_pos, root_quat = robot.root_link.get_position_orientation()
+        
+        # For each candidate pose, compute the relative joint values
+        for i, pose_2d in enumerate(room_valid_poses):
+            # Construct full 3D target pose from 2D pose [x, y, yaw]
+            target_pos = th.tensor([pose_2d[0], pose_2d[1], root_pos[2]])  # Use root_link's z
+            target_quat = T.euler2quat(th.tensor([0.0, 0.0, pose_2d[2]]))  # Only yaw rotation
+            
+            # Compute relative transform from root_link to target
+            inv_root_pos, inv_root_quat = T.invert_pose_transform(root_pos, root_quat)
+            relative_pos, relative_quat = T.pose_transform(inv_root_pos, inv_root_quat, target_pos, target_quat)
+            
+            # Convert quaternion to euler angles (intrinsic xyz)
+            relative_euler = T.quat2euler(relative_quat)
+            
+            # Set joint positions: base_control_idx corresponds to [x, y, rz] joints
+            batch_joint_positions[i, robot.base_control_idx[0]] = relative_pos[0]  # x
+            batch_joint_positions[i, robot.base_control_idx[1]] = relative_pos[1]  # y
+            batch_joint_positions[i, robot.base_control_idx[2]] = relative_euler[2]  # rz (yaw)
+    else:
+        # For non-holonomic robots, directly use the 2D poses
+        batch_joint_positions[:, robot.base_control_idx] = room_valid_poses
 
     obj_in_hand = controller._get_obj_in_hand()
     attached_obj = (
@@ -502,6 +533,7 @@ def plan_navigation(
     robot,
     target_pose_2d: th.Tensor,
     verbose: bool = True,
+    visualize: bool = False,
 ) -> Optional[th.Tensor]:
     """
     Plan navigation trajectory to a target 2D pose.
@@ -511,12 +543,16 @@ def plan_navigation(
         robot: Robot object.
         target_pose_2d: Target 2D pose (x, y, yaw).
         verbose: Whether to print progress information.
+        visualize: Whether to visualize debug info when planning fails.
 
     Returns:
         Joint trajectory tensor if successful, None otherwise.
     """
     # Convert 2D pose to 3D pose
     pose_3d = controller._get_robot_pose_from_2d_pose(target_pose_2d)
+    base_link_pos = robot.links[robot.base_footprint_link_name].get_position_orientation()[0]
+    pose_3d = (pose_3d[0].clone(), pose_3d[1])
+    pose_3d[0][2] = base_link_pos[2]
     target_pos = {robot.base_footprint_link_name: pose_3d[0]}
     target_quat = {robot.base_footprint_link_name: pose_3d[1]}
 
@@ -524,16 +560,67 @@ def plan_navigation(
         print(f"  Target position: {pose_3d[0].tolist()}")
         print(f"  Target orientation: {pose_3d[1].tolist()}")
 
-    # Plan motion
-    q_traj = controller._plan_joint_motion(
-        target_pos=target_pos,
-        target_quat=target_quat,
-        embodiment_selection=CuRoboEmbodimentSelection.BASE,
-        skip_obstacle_update=True,
-    )
+    # Plan motion - catch exception if planning fails
+    # Enable graph search for base navigation to handle obstacles
+    q_traj = None
+    planning_error_msg = None
+    try:
+        q_traj = controller._plan_joint_motion(
+            target_pos=target_pos,
+            target_quat=target_quat,
+            embodiment_selection=CuRoboEmbodimentSelection.BASE,
+            skip_obstacle_update=True,
+            enable_graph=True,  # Enable graph search for complex navigation paths
+            verbose=verbose,
+        )
+    except ActionPrimitiveError as e:
+        planning_error_msg = str(e)
 
-    if q_traj is not None and verbose:
-        print(f"  [OK] Planned trajectory with {len(q_traj)} waypoints")
+    if q_traj is not None:
+        if verbose:
+            print(f"  [OK] Planned trajectory with {len(q_traj)} waypoints")
+    else:
+        # Planning failed - provide debug information
+        if verbose:
+            print(f"\n  [FAILED] Navigation planning failed")
+            if planning_error_msg:
+                print(f"  Error: {planning_error_msg}")
+            robot_pos, robot_quat = robot.get_position_orientation()
+            robot_yaw = T.quat2euler(robot_quat)[2].item()
+            print(f"  Debug info:")
+            print(f"    Robot current position: ({robot_pos[0].item():.3f}, {robot_pos[1].item():.3f}, {robot_pos[2].item():.3f})")
+            print(f"    Robot current yaw: {math.degrees(robot_yaw):.1f} deg")
+            print(f"    Target position: ({target_pose_2d[0].item():.3f}, {target_pose_2d[1].item():.3f})")
+            print(f"    Target yaw: {math.degrees(target_pose_2d[2].item()):.1f} deg")
+            distance = math.sqrt((target_pose_2d[0].item() - robot_pos[0].item())**2 + 
+                                  (target_pose_2d[1].item() - robot_pos[1].item())**2)
+            print(f"    Distance to target: {distance:.3f}m")
+            print(f"  Possible causes:")
+            print(f"    - Obstacles blocking the path")
+            print(f"    - Target position is in collision")
+            print(f"    - IK solution not found for base motion")
+        
+        if visualize:
+            print(f"\n  Visualizing navigation failure...")
+            # Visualize current robot pose and target pose
+            visualize_robot_and_sampled_pose(
+                robot=robot,
+                sampled_pose=target_pose_2d,
+                verbose=False,
+            )
+            # Visualize obstacles
+            visualize_obstacles(
+                motion_generator=controller._motion_generator,
+                verbose=True,
+            )
+            # Allow user to inspect
+            og.sim.enable_viewer_camera_teleoperation()
+            print(f"  Press Ctrl+C to exit visualization...")
+            try:
+                while True:
+                    og.sim.step()
+            except KeyboardInterrupt:
+                print(f"  Visualization ended by user.")
 
     return q_traj
 
@@ -596,7 +683,6 @@ def _visualize_failed_poses(
         visualize_robot_spheres_at_config(
             motion_generator=motion_generator,
             joint_positions=collision_joint_positions[0],
-            color=(1.0, 0.3, 0.3, 0.5),  # Semi-transparent red
             verbose=True,
         )
 
@@ -941,9 +1027,8 @@ def main():
 
         # Create controller
         controller = StarterSemanticActionPrimitives(
-            env, robot, enable_head_tracking=False, curobo_batch_size=1
+            env, robot, enable_head_tracking=False, curobo_batch_size=1, use_cuda_graph=False
         )
-
         # Execute navigate and grasp
         result = navigate_and_grasp(
             controller=controller,

@@ -388,10 +388,17 @@ class HolonomicBaseRobot(LocomotionRobot):
                 cur_rz_joint_pos = self.get_joint_positions()[self.base_idx][5]
                 delta_q = wrap_angle(command[2] - cur_rz_joint_pos)
 
-                # For translation, we need to convert the command to the robot local frame
+                # command[0], command[1] are joint values (relative to root_link/base_footprint_x)
+                # First convert joint values to world coordinates
+                root_pos, root_quat = self.root_link.get_position_orientation()
+                target_joint_pos = th.tensor([command[0], command[1], 0.0], dtype=th.float32)
+                target_joint_quat = th.tensor([0.0, 0.0, 0.0, 1.0], dtype=th.float32)
+                target_world_pos, _ = T.pose_transform(root_pos, root_quat, target_joint_pos, target_joint_quat)
+                target_world_pos[2] = self.get_position_orientation()[0][2]  # Keep current Z height
+                
+                # Then convert world coordinates to robot local frame
                 body_pose = self.get_position_orientation()
-                canonical_pos = th.tensor([command[0], command[1], body_pose[0][2]], dtype=th.float32)
-                local_pos = T.relative_pose_transform(canonical_pos, th.tensor([0.0, 0.0, 0.0, 1.0]), *body_pose)[0]
+                local_pos = T.relative_pose_transform(target_world_pos, th.tensor([0.0, 0.0, 0.0, 1.0]), *body_pose)[0]
                 command = th.tensor([local_pos[0], local_pos[1], delta_q])
             action.append(controller._reverse_preprocess_command(command))
         action = th.cat(action, dim=0)
