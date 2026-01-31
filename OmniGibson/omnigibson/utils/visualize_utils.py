@@ -108,6 +108,66 @@ def visualize_robot_spheres(
             )
 
 
+def visualize_robot_spheres_at_config(
+    motion_generator: CuRoboMotionGenerator,
+    joint_positions: th.Tensor,
+    color: ColorType = COLOR_RED,
+    emb_sel: CuRoboEmbodimentSelection = CuRoboEmbodimentSelection.DEFAULT,
+    verbose: bool = True,
+) -> None:
+    """
+    Visualize the robot's collision spheres at a specific joint configuration.
+
+    This is useful for debugging why a sampled pose is considered a collision.
+    The spheres show the robot's full body (base, trunk, arms) at the given config.
+
+    Args:
+        motion_generator: CuRoboMotionGenerator instance.
+        joint_positions: Joint positions tensor (1D or 2D with batch dim).
+        color: RGBA color for the spheres.
+        emb_sel: Embodiment selection for CuRobo.
+        verbose: Whether to print debug information.
+    """
+    import omnigibson.lazy as lazy
+
+    # Ensure 2D tensor
+    if joint_positions.dim() == 1:
+        joint_positions = joint_positions.unsqueeze(0)
+
+    # Create joint state
+    cu_js = lazy.curobo.types.state.JointState(
+        position=motion_generator.tensor_args.to_device(joint_positions),
+        joint_names=motion_generator.robot_joint_names,
+    ).get_ordered_joint_state(motion_generator.mg[emb_sel].kinematics.joint_names)
+
+    # Get robot's sphere representation at this configuration
+    spheres = motion_generator.mg[emb_sel].kinematics.get_robot_as_spheres(cu_js.position)
+
+    if verbose:
+        print(f"=== Robot Spheres at Config ===")
+        print(f"Number of spheres: {len(spheres[0]) if spheres else 0}")
+
+    # Visualize spheres
+    if spheres and len(spheres[0]) > 0:
+        for sphere in spheres[0]:
+            center = sphere.pose[:3].cpu().numpy()
+            radius = _to_scalar(sphere.radius)
+
+            draw_box(
+                center=center.tolist(),
+                extents=[radius * 2, radius * 2, radius * 2],
+                color=color,
+                size=1.0,
+            )
+
+        if verbose:
+            # Print bounding box info
+            all_centers = th.stack([s.pose[:3] for s in spheres[0]])
+            min_bound = all_centers.min(dim=0).values.cpu()
+            max_bound = all_centers.max(dim=0).values.cpu()
+            print(f"Bounding box: ({min_bound[0]:.2f}, {min_bound[1]:.2f}, {min_bound[2]:.2f}) to ({max_bound[0]:.2f}, {max_bound[1]:.2f}, {max_bound[2]:.2f})")
+
+
 def visualize_obstacles(
     motion_generator: CuRoboMotionGenerator,
     save_path: Optional[str] = None,

@@ -38,6 +38,7 @@ from omnigibson.utils.visualize_utils import (
     visualize_2d_pose,
     visualize_obstacles,
     visualize_robot_and_sampled_pose,
+    visualize_robot_spheres_at_config,
     visualize_sampling_region,
     visualize_trajectory,
 )
@@ -402,12 +403,13 @@ def sample_pose_near_object(
     if verbose:
         print(f"  Collision filter: {len(collision_free_local_indices)}/{len(room_valid_indices)} passed")
 
-    # Collect collision failed poses for visualization
-    collision_failed_poses = [
-        room_valid_poses[i].clone()
-        for i in range(len(room_valid_poses))
-        if collision_results[i].item()
-    ]
+    # Collect collision failed poses and joint positions for visualization
+    collision_failed_poses = []
+    collision_failed_joint_positions = []
+    for i in range(len(room_valid_poses)):
+        if collision_results[i].item():
+            collision_failed_poses.append(room_valid_poses[i].clone())
+            collision_failed_joint_positions.append(batch_joint_positions[i].clone())
 
     if len(collision_free_local_indices) == 0:
         stats["total_attempts"] = max_samples
@@ -416,7 +418,12 @@ def sample_pose_near_object(
             print(f"    Collision failures: {stats['collision_failures']}")
             print(f"    Room failures: {stats['room_failures']}")
         if visualize:
-            _visualize_failed_poses(robot, collision_failed_poses, [], max_display=MAX_VERBOSE_SAMPLES)
+            _visualize_failed_poses(
+                robot, collision_failed_poses, [],
+                max_display=MAX_VERBOSE_SAMPLES,
+                motion_generator=controller._motion_generator,
+                collision_joint_positions=collision_failed_joint_positions,
+            )
         return SampledPoseResult(
             pregrasp_pose=None,
             grasp_pose=None,
@@ -474,7 +481,12 @@ def sample_pose_near_object(
 
     # Visualize failed poses if requested
     if visualize:
-        _visualize_failed_poses(robot, collision_failed_poses, reachability_failed_poses, max_display=MAX_VERBOSE_SAMPLES)
+        _visualize_failed_poses(
+            robot, collision_failed_poses, reachability_failed_poses,
+            max_display=MAX_VERBOSE_SAMPLES,
+            motion_generator=controller._motion_generator,
+            collision_joint_positions=collision_failed_joint_positions,
+        )
 
     return SampledPoseResult(
         pregrasp_pose=None,
@@ -532,12 +544,15 @@ def _visualize_failed_poses(
     reachability_poses: List[th.Tensor],
     z_height: float = 0.1,
     max_display: int = 10,
+    motion_generator=None,
+    collision_joint_positions: Optional[List[th.Tensor]] = None,
 ) -> None:
     """
     Visualize failed candidate poses for debugging.
 
     Uses visualize_2d_pose to show position and orientation (with arrows).
-    Red = collision failures, Yellow/Orange = reachability failures.
+    Red = collision failures, Green = reachability failures.
+    Optionally shows collision spheres for the first collision failure.
 
     Args:
         robot: Robot object for visualizing current robot pose.
@@ -545,6 +560,8 @@ def _visualize_failed_poses(
         reachability_poses: List of 2D poses (x, y, yaw) that failed reachability check.
         z_height: Z-coordinate for visualization.
         max_display: Maximum number of poses to display per category.
+        motion_generator: Optional CuRoboMotionGenerator for sphere visualization.
+        collision_joint_positions: Optional list of joint positions for collision failures.
     """
     # Visualize robot's current pose (blue)
     robot_pos, robot_quat = robot.get_position_orientation()
@@ -572,10 +589,23 @@ def _visualize_failed_poses(
             verbose=False,
         )
 
+    # Visualize collision spheres for first collision failure (shows WHY it's a collision)
+    if motion_generator is not None and collision_joint_positions and len(collision_joint_positions) > 0:
+        print(f"\n  Visualizing collision spheres for first collision failure...")
+        print(f"  (Red boxes = robot collision spheres at sampled position)")
+        visualize_robot_spheres_at_config(
+            motion_generator=motion_generator,
+            joint_positions=collision_joint_positions[0],
+            color=(1.0, 0.3, 0.3, 0.5),  # Semi-transparent red
+            verbose=True,
+        )
+
     print(f"\n  Visualization legend:")
     print(f"    Blue arrow = Robot current pose")
     print(f"    Red arrows ({len(collision_poses[:max_display])}) = Collision failures")
     print(f"    Green arrows ({len(reachability_poses[:max_display])}) = Reachability failures")
+    if motion_generator is not None and collision_joint_positions:
+        print(f"    Red boxes = Robot collision spheres at first collision failure")
 
     # Allow user to move camera more easily
     og.sim.enable_viewer_camera_teleoperation()
