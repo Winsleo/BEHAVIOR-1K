@@ -35,6 +35,7 @@ from omnigibson.learning.utils.eval_utils import (
 from omnigibson.macros import gm, macros
 from omnigibson.utils.asset_utils import get_task_instance_path
 from omnigibson.utils.python_utils import recursively_convert_to_torch
+from omnigibson.utils.geometry_utils import wrap_angle
 from omnigibson.utils.ui_utils import clear_debug_drawing, draw_box
 from omnigibson.utils.visualize_utils import (
     visualize_2d_pose,
@@ -63,10 +64,16 @@ with macros.unlocked():
 
 # Constants
 NUM_EVAL_INSTANCES = 10
-DEFAULT_SAMPLING_RADIUS = 2.0
+DEFAULT_SAMPLING_RADIUS = 1.5
 DEFAULT_MAX_SAMPLES = 100
 DEFAULT_IMAGE_SIZE = 224
 MAX_VERBOSE_SAMPLES = 20
+
+# Pose selection constants
+OPTIMAL_DIST_MIN = 0.3  # Too close may cause collision
+OPTIMAL_DIST_MAX = 0.5  # Too far may not reach target
+OPTIMAL_DIST_IDEAL = 0.4  # Ideal manipulation distance
+TOP_K_CANDIDATES = 5  # Number of candidates for trajectory evaluation
 
 
 # ============================================================================
@@ -82,8 +89,8 @@ class GraspResult(Enum):
 
 
 @dataclass
-class SampledPoseResult:
-    """Result of pose sampling near an object."""
+class GraspBasePoseResult:
+    """Result of finding optimal base pose for grasping."""
     pregrasp_pose: Optional[Tuple[th.Tensor, th.Tensor]]
     grasp_pose: Optional[Tuple[th.Tensor, th.Tensor]]
     base_pose_2d: Optional[th.Tensor]
@@ -140,7 +147,7 @@ def navigate_and_grasp(
     # if visualize:
     #     visualize_obstacles(controller._motion_generator, verbose=verbose)
 
-    sample_result = sample_pose_near_object(
+    grasp_base_result = find_optimal_grasp_base_pose(
         controller=controller,
         obj=obj,
         max_samples=max_samples,
@@ -148,14 +155,14 @@ def navigate_and_grasp(
         visualize=visualize,
     )
 
-    if not sample_result.success:
+    if not grasp_base_result.success:
         if verbose:
-            print(f"[FAILED] Could not find valid pose near object")
+            print(f"[FAILED] Could not find optimal base pose for grasping")
         return GraspResult.SAMPLING_FAILED
 
-    pregrasp_pose = sample_result.pregrasp_pose
-    grasp_pose = sample_result.grasp_pose
-    base_pose_2d = sample_result.base_pose_2d
+    pregrasp_pose = grasp_base_result.pregrasp_pose
+    grasp_pose = grasp_base_result.grasp_pose
+    base_pose_2d = grasp_base_result.base_pose_2d
 
     # Visualize sampling region and sampled pose
     if visualize:
@@ -239,7 +246,473 @@ def navigate_and_grasp(
     return GraspResult.SUCCESS
 
 
-def sample_pose_near_object(
+# ============================================================================
+# Grasp Base Pose Selection Helper Functions
+# ============================================================================
+
+class SamplingStrategy(Enum):
+    """Sampling strategy for candidate pose generation."""
+    RANDOM = "random"                    # Pure random (original behavior)
+    UNIFORM_POLAR = "uniform_polar"      # Area-uniform polar sampling
+    FIBONACCI_SPIRAL = "fibonacci_spiral" # Fibonacci spiral for very uniform distribution
+    CONCENTRIC_RINGS = "concentric_rings" # Concentric rings with uniform angular spacing
+
+
+def generate_candidate_poses(
+    target_pos: th.Tensor,
+    num_samples: int,
+    sampling_radius: float,
+    arm_workspace_offset: float = 0.0,
+    min_radius: float = 0.0,
+    strategy: SamplingStrategy = SamplingStrategy.FIBONACCI_SPIRAL,
+) -> th.Tensor:
+    """
+    Generate candidate 2D poses around a target position with uniform distribution.
+
+    Args:
+        target_pos: Target position (x, y) or (x, y, z).
+        num_samples: Number of candidate poses to generate.
+        sampling_radius: Maximum distance from target.
+        arm_workspace_offset: Offset for yaw calculation based on arm workspace.
+        min_radius: Minimum distance from target (default 0.0).
+        strategy: Sampling strategy to use (default: FIBONACCI_SPIRAL).
+
+    Returns:
+        Tensor of shape (num_samples, 3) with [x, y, yaw] for each candidate.
+    """
+    if strategy == SamplingStrategy.RANDOM:
+        # Original random sampling (non-uniform in area)
+        distances = th.rand(num_samples) * (sampling_radius - min_radius) + min_radius
+        angles = th.rand(num_samples) * 2 * math.pi - math.pi
+
+    elif strategy == SamplingStrategy.UNIFORM_POLAR:
+        # Area-uniform polar sampling: use sqrt(rand) for distance
+        # This ensures equal probability per unit area
+        t = th.rand(num_samples)
+        # Map t to [min_radius^2, sampling_radius^2] then sqrt
+        r_squared_min = min_radius ** 2
+        r_squared_max = sampling_radius ** 2
+        distances = th.sqrt(t * (r_squared_max - r_squared_min) + r_squared_min)
+        angles = th.rand(num_samples) * 2 * math.pi - math.pi
+
+    elif strategy == SamplingStrategy.FIBONACCI_SPIRAL:
+        # Fibonacci spiral: very uniform distribution using golden angle
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))  # ~137.5 degrees
+        indices = th.arange(num_samples, dtype=th.float32)
+        
+        # Radial distribution: sqrt for area uniformity
+        t = (indices + 0.5) / num_samples  # Offset by 0.5 for better centering
+        r_squared_min = min_radius ** 2
+        r_squared_max = sampling_radius ** 2
+        distances = th.sqrt(t * (r_squared_max - r_squared_min) + r_squared_min)
+        
+        # Angular distribution: golden angle spiral
+        angles = indices * golden_angle
+        # Wrap to [-pi, pi]
+        angles = th.remainder(angles + math.pi, 2 * math.pi) - math.pi
+
+    elif strategy == SamplingStrategy.CONCENTRIC_RINGS:
+        # Concentric rings with uniform angular spacing per ring
+        # Number of rings based on sqrt of samples for roughly equal points per unit area
+        num_rings = max(1, int(math.sqrt(num_samples)))
+        samples_per_ring = num_samples // num_rings
+        extra_samples = num_samples % num_rings
+        
+        distances_list = []
+        angles_list = []
+        
+        for ring_idx in range(num_rings):
+            # Radius for this ring (area-uniform spacing)
+            t = (ring_idx + 0.5) / num_rings
+            r_squared_min = min_radius ** 2
+            r_squared_max = sampling_radius ** 2
+            ring_radius = math.sqrt(t * (r_squared_max - r_squared_min) + r_squared_min)
+            
+            # Number of samples in this ring
+            n_in_ring = samples_per_ring + (1 if ring_idx < extra_samples else 0)
+            
+            # Uniform angular spacing with random offset per ring
+            angle_offset = th.rand(1).item() * 2 * math.pi
+            ring_angles = th.linspace(0, 2 * math.pi, n_in_ring + 1)[:-1] + angle_offset
+            ring_angles = th.remainder(ring_angles + math.pi, 2 * math.pi) - math.pi
+            
+            distances_list.append(th.full((n_in_ring,), ring_radius))
+            angles_list.append(ring_angles)
+        
+        distances = th.cat(distances_list)
+        angles = th.cat(angles_list)
+
+    else:
+        raise ValueError(f"Unknown sampling strategy: {strategy}")
+
+    # Compute x, y positions
+    x = target_pos[0] + distances * th.cos(angles)
+    y = target_pos[1] + distances * th.sin(angles)
+    
+    # Yaw: face toward target with arm workspace offset
+    yaws = angles + math.pi - arm_workspace_offset
+
+    return th.stack([x, y, yaws], dim=1)
+
+
+def filter_poses_by_room(
+    poses: th.Tensor,
+    valid_rooms: List,
+    scene_seg_map,
+) -> Tuple[th.Tensor, th.Tensor]:
+    """
+    Filter poses to only include those in valid rooms.
+
+    Args:
+        poses: Candidate poses tensor of shape (N, 3).
+        valid_rooms: List of valid room identifiers.
+        scene_seg_map: Scene segmentation map for room queries.
+
+    Returns:
+        Tuple of (filtered_poses, valid_indices).
+    """
+    num_poses = len(poses)
+    valid_mask = th.zeros(num_poses, dtype=th.bool)
+
+    for i in range(num_poses):
+        room = scene_seg_map.get_room_instance_by_point(poses[i, :2])
+        valid_mask[i] = room in valid_rooms
+
+    valid_indices = th.where(valid_mask)[0]
+    return poses[valid_indices], valid_indices
+
+
+def convert_poses_to_joint_positions(
+    poses: th.Tensor,
+    robot,
+    current_joint_pos: th.Tensor,
+) -> th.Tensor:
+    """
+    Convert 2D world poses to robot joint positions.
+
+    Args:
+        poses: 2D poses tensor of shape (N, 3) with [x, y, yaw].
+        robot: Robot instance.
+        current_joint_pos: Current joint positions tensor.
+
+    Returns:
+        Batch joint positions tensor of shape (N, num_joints).
+    """
+    num_poses = len(poses)
+    batch_joint_positions = current_joint_pos.unsqueeze(0).repeat(num_poses, 1)
+
+    if isinstance(robot, HolonomicBaseRobot):
+        root_pos, root_quat = robot.root_link.get_position_orientation()
+
+        for i, pose_2d in enumerate(poses):
+            target_pos = th.tensor([pose_2d[0], pose_2d[1], root_pos[2]])
+            target_quat = T.euler2quat(th.tensor([0.0, 0.0, pose_2d[2]]))
+
+            inv_root_pos, inv_root_quat = T.invert_pose_transform(root_pos, root_quat)
+            relative_pos, relative_quat = T.pose_transform(
+                inv_root_pos, inv_root_quat, target_pos, target_quat
+            )
+            relative_euler = T.quat2euler(relative_quat)
+
+            batch_joint_positions[i, robot.base_control_idx[0]] = relative_pos[0]
+            batch_joint_positions[i, robot.base_control_idx[1]] = relative_pos[1]
+            batch_joint_positions[i, robot.base_control_idx[2]] = relative_euler[2]
+    else:
+        batch_joint_positions[:, robot.base_control_idx] = poses
+
+    return batch_joint_positions
+
+
+def batch_collision_check(
+    controller: StarterSemanticActionPrimitives,
+    batch_joint_positions: th.Tensor,
+    attached_obj: Optional[Dict] = None,
+) -> th.Tensor:
+    """
+    Perform batch collision checking for joint positions.
+
+    Args:
+        controller: StarterSemanticActionPrimitives instance.
+        batch_joint_positions: Joint positions tensor of shape (N, num_joints).
+        attached_obj: Optional attached object for collision checking.
+
+    Returns:
+        Boolean tensor of shape (N,) indicating collision status.
+    """
+    return controller._motion_generator.check_collisions(
+        batch_joint_positions,
+        self_collision_check=False,
+        skip_obstacle_update=True,
+        attached_obj=attached_obj,
+    ).cpu()
+
+
+def check_reachability(
+    controller: StarterSemanticActionPrimitives,
+    poses: th.Tensor,
+    batch_joint_positions: th.Tensor,
+    collision_free_indices: th.Tensor,
+    target_pose: Tuple[th.Tensor, th.Tensor],
+    original_indices: th.Tensor,
+    verbose: bool = False,
+) -> Tuple[List[Tuple[th.Tensor, int]], List[th.Tensor], int]:
+    """
+    Check reachability for collision-free poses.
+
+    Args:
+        controller: StarterSemanticActionPrimitives instance.
+        poses: Filtered poses tensor.
+        batch_joint_positions: Corresponding joint positions.
+        collision_free_indices: Indices of collision-free poses.
+        target_pose: Target end-effector pose.
+        original_indices: Original global indices.
+        verbose: Whether to print progress.
+
+    Returns:
+        Tuple of (valid_poses_list, failed_poses_list, failure_count).
+    """
+    robot_pos, _ = controller.robot.get_position_orientation()
+    robot_xy = robot_pos[:2]
+
+    valid_poses = []
+    failed_poses = []
+    failure_count = 0
+
+    for local_idx in collision_free_indices:
+        candidate_pose = poses[local_idx]
+        joint_pos = batch_joint_positions[local_idx]
+
+        if controller._target_in_reach_of_robot(
+            target_pose, initial_joint_pos=joint_pos, skip_obstacle_update=True
+        ):
+            global_idx = original_indices[local_idx].item()
+            valid_poses.append((candidate_pose.clone(), global_idx))
+            if verbose:
+                dist = th.norm(candidate_pose[:2] - robot_xy).item()
+                print(f"    Sample {global_idx}: Valid at ({candidate_pose[0].item():.2f}, "
+                      f"{candidate_pose[1].item():.2f}), dist={dist:.2f}m")
+        else:
+            failure_count += 1
+            failed_poses.append(candidate_pose.clone())
+            if verbose and len(failed_poses) <= MAX_VERBOSE_SAMPLES:
+                print(f"    Sample {original_indices[local_idx].item()}: Not reachable at "
+                      f"({candidate_pose[0].item():.2f}, {candidate_pose[1].item():.2f})")
+
+    return valid_poses, failed_poses, failure_count
+
+
+def compute_heuristic_score(
+    pose_2d: th.Tensor,
+    target_xy: th.Tensor,
+    robot_xy: th.Tensor,
+    robot_yaw: float,
+) -> float:
+    """
+    Compute a heuristic score for a candidate pose (lower is better).
+
+    Args:
+        pose_2d: Candidate pose [x, y, yaw].
+        target_xy: Target object position [x, y].
+        robot_xy: Robot current position [x, y].
+        robot_yaw: Robot current yaw angle.
+
+    Returns:
+        Heuristic score (lower is better).
+    """
+    pose_xy = pose_2d[:2]
+    pose_yaw = pose_2d[2].item()
+
+    # Factor 1: Distance to target
+    dist_to_target = th.norm(pose_xy - target_xy).item()
+    if dist_to_target < OPTIMAL_DIST_MIN:
+        dist_cost = (OPTIMAL_DIST_MIN - dist_to_target) * 6.0
+    elif dist_to_target > OPTIMAL_DIST_MAX:
+        dist_cost = (dist_to_target - OPTIMAL_DIST_MAX) * 6.0
+    else:
+        dist_cost = abs(dist_to_target - OPTIMAL_DIST_IDEAL) * 1.0
+
+    # Factor 2: Facing target
+    target_direction = th.atan2(
+        target_xy[1] - pose_xy[1],
+        target_xy[0] - pose_xy[0]
+    ).item()
+    facing_error = abs(wrap_angle(pose_yaw - target_direction))
+    facing_cost = facing_error * 0.3
+
+    # Factor 3: Travel distance
+    travel_dist = th.norm(pose_xy - robot_xy).item()
+    travel_cost = travel_dist * 1.0
+
+    # Factor 4: Rotation change
+    yaw_change = abs(wrap_angle(pose_yaw - robot_yaw))
+    rotation_cost = yaw_change * 0.3
+
+    return dist_cost + facing_cost + travel_cost + rotation_cost
+
+
+def compute_trajectory_complexity(
+    q_traj: th.Tensor,
+    robot,
+) -> Tuple[float, float]:
+    """
+    Compute trajectory complexity based on path length and cumulative rotation.
+
+    Args:
+        q_traj: Joint trajectory tensor.
+        robot: Robot instance.
+
+    Returns:
+        Tuple of (path_length, cumulative_rotation) in meters and radians.
+    """
+    if q_traj is None or len(q_traj) < 2:
+        return float('inf'), float('inf')
+
+    base_idx = robot.base_idx
+    path_length = 0.0
+    cumulative_rotation = 0.0
+
+    root_pos, root_quat = robot.root_link.get_position_orientation()
+    prev_world_pos = None
+    prev_yaw = None
+
+    for q in q_traj:
+        joint_x = q[base_idx[0]].item()
+        joint_y = q[base_idx[1]].item()
+        joint_yaw = q[base_idx[5]].item()
+
+        local_pos = th.tensor([joint_x, joint_y, 0.0])
+        local_quat = th.tensor([0.0, 0.0, 0.0, 1.0])
+        world_pos, _ = T.pose_transform(root_pos, root_quat, local_pos, local_quat)
+
+        if prev_world_pos is not None:
+            path_length += th.norm(world_pos[:2] - prev_world_pos[:2]).item()
+            cumulative_rotation += abs(wrap_angle(joint_yaw - prev_yaw))
+
+        prev_world_pos = world_pos
+        prev_yaw = joint_yaw
+
+    return path_length, cumulative_rotation
+
+
+def compute_trajectory_score(
+    path_length: float,
+    cumulative_rotation: float,
+    dist_to_target: float,
+) -> float:
+    """
+    Compute final trajectory-based score.
+
+    Args:
+        path_length: Total path length in meters.
+        cumulative_rotation: Total rotation in radians.
+        dist_to_target: Distance from pose to target object.
+
+    Returns:
+        Trajectory score (lower is better).
+    """
+    score = path_length + cumulative_rotation * 0.5
+
+    # Add manipulation quality penalty
+    if dist_to_target < OPTIMAL_DIST_MIN:
+        score += (OPTIMAL_DIST_MIN - dist_to_target) * 3.0
+    elif dist_to_target > OPTIMAL_DIST_MAX:
+        score += (dist_to_target - OPTIMAL_DIST_MAX) * 3.0
+
+    return score
+
+
+def select_optimal_pose(
+    valid_poses: List[Tuple[th.Tensor, int]],
+    target_xy: th.Tensor,
+    robot_xy: th.Tensor,
+    robot_yaw: float,
+    controller: StarterSemanticActionPrimitives,
+    robot,
+    verbose: bool = False,
+) -> Tuple[th.Tensor, int, Optional[Tuple[float, float, int]]]:
+    """
+    Select the optimal pose using two-stage evaluation.
+
+    Stage 1: Heuristic filtering to select top-K candidates.
+    Stage 2: Trajectory-based evaluation for final selection.
+
+    Args:
+        valid_poses: List of (pose_2d, global_idx) tuples.
+        target_xy: Target object position.
+        robot_xy: Robot current position.
+        robot_yaw: Robot current yaw.
+        controller: StarterSemanticActionPrimitives instance.
+        robot: Robot instance.
+        verbose: Whether to print progress.
+
+    Returns:
+        Tuple of (best_pose, best_idx, trajectory_info).
+        trajectory_info is (path_length, cumulative_rotation, num_waypoints) or None.
+    """
+    # Stage 1: Heuristic filtering
+    scored_poses = [
+        (pose, idx, compute_heuristic_score(pose, target_xy, robot_xy, robot_yaw))
+        for pose, idx in valid_poses
+    ]
+    scored_poses.sort(key=lambda x: x[2])
+    top_k_poses = scored_poses[:min(TOP_K_CANDIDATES, len(scored_poses))]
+
+    if verbose:
+        print(f"\n  Stage 1: Selected top-{len(top_k_poses)} candidates from {len(valid_poses)} valid poses")
+        print(f"  Stage 2: Evaluating trajectory complexity...")
+
+    # Stage 2: Trajectory evaluation
+    best_pose = None
+    best_idx = None
+    best_traj_score = float('inf')
+    best_traj_info = None
+
+    for i, (pose_2d, global_idx, _) in enumerate(top_k_poses):
+        try:
+            q_traj = plan_navigation(
+                controller=controller,
+                robot=robot,
+                target_pose_2d=pose_2d,
+                verbose=False,
+                visualize=False,
+            )
+        except Exception:
+            q_traj = None
+
+        if q_traj is None:
+            if verbose:
+                print(f"    Candidate {i+1}: Planning failed, skipped")
+            continue
+
+        path_length, cumulative_rotation = compute_trajectory_complexity(q_traj, robot)
+        dist_to_target = th.norm(pose_2d[:2] - target_xy).item()
+        traj_score = compute_trajectory_score(path_length, cumulative_rotation, dist_to_target)
+
+        if verbose:
+            print(f"    Candidate {i+1}: path={path_length:.2f}m, "
+                  f"rotation={math.degrees(cumulative_rotation):.1f}deg, score={traj_score:.3f}")
+
+        if traj_score < best_traj_score:
+            best_traj_score = traj_score
+            best_pose = pose_2d
+            best_idx = global_idx
+            best_traj_info = (path_length, cumulative_rotation, len(q_traj))
+
+    # Fallback to heuristic best if all planning failed
+    if best_pose is None:
+        if verbose:
+            print(f"  Warning: All trajectory planning failed, using heuristic best")
+        best_pose, best_idx, _ = top_k_poses[0]
+        best_traj_info = None
+
+    return best_pose, best_idx, best_traj_info
+
+
+# ============================================================================
+# Main Grasp Base Pose Selection Function
+# ============================================================================
+
+def find_optimal_grasp_base_pose(
     controller: StarterSemanticActionPrimitives,
     obj,
     max_samples: int = DEFAULT_MAX_SAMPLES,
@@ -247,36 +720,46 @@ def sample_pose_near_object(
     verbose: bool = True,
     visualize: bool = False,
     seed: int = 42,
-) -> SampledPoseResult:
+) -> GraspBasePoseResult:
     """
-    Sample a valid 2D base pose near an object for grasping.
+    Find the optimal robot base pose for grasping a target object.
 
-    This function finds a collision-free position where:
-    - The robot base does not collide with obstacles
-    - The target object is reachable by the robot arm
-    - The position is in the same room as the object
+    This function performs a multi-stage search to find the best base pose:
+    1. Sample candidate poses around the target object
+    2. Filter by room constraints (same room as object)
+    3. Batch collision checking for robot base
+    4. Verify arm reachability to target
+    5. Two-stage optimal selection:
+       - Stage 1: Heuristic filtering (distance, facing, travel cost)
+       - Stage 2: Trajectory complexity evaluation (actual path length, rotation)
 
-    Uses batch collision checking for efficiency.
+    The selected pose optimizes for:
+    - Manipulation quality: Optimal distance to target (0.3-0.5m)
+    - Movement efficiency: Minimal travel distance and rotation
+    - Trajectory simplicity: Minimal path length and cumulative rotation
 
     Args:
         controller: StarterSemanticActionPrimitives instance.
-        obj: Target object.
-        max_samples: Maximum number of sampling attempts.
-        sampling_radius: Maximum distance from object to sample.
+        obj: Target object to grasp.
+        max_samples: Maximum number of candidate poses to generate.
+        sampling_radius: Maximum distance from object center to sample.
         verbose: Whether to print progress information.
-        visualize: Whether to visualize failed poses.
+        visualize: Whether to visualize failed poses for debugging.
         seed: Random seed for reproducibility.
 
     Returns:
-        SampledPoseResult containing pose information and statistics.
+        GraspBasePoseResult containing:
+        - pregrasp_pose: End-effector pre-grasp pose
+        - grasp_pose: End-effector grasp pose
+        - base_pose_2d: Optimal robot base pose [x, y, yaw]
+        - success: Whether a valid pose was found
+        - stats: Filtering statistics (failures by category)
     """
-    # Set random seed for reproducibility
     th.manual_seed(seed)
 
     robot = controller.robot
     arm = controller.arm
 
-    # Initialize statistics
     stats = {
         "total_attempts": 0,
         "collision_failures": 0,
@@ -284,7 +767,7 @@ def sample_pose_near_object(
         "room_failures": 0,
     }
 
-    # Sample grasp pose for the object
+    # Step 1: Sample grasp pose
     if verbose:
         print(f"  Sampling grasp pose for object...")
 
@@ -303,62 +786,43 @@ def sample_pose_near_object(
     except Exception as e:
         if verbose:
             print(f"  [ERROR] Grasp pose sampling failed: {e}")
-        return SampledPoseResult(
-            pregrasp_pose=None,
-            grasp_pose=None,
-            base_pose_2d=None,
-            success=False,
-            stats=stats,
+        return GraspBasePoseResult(
+            pregrasp_pose=None, grasp_pose=None, base_pose_2d=None,
+            success=False, stats=stats,
         )
 
     target_pose = eef_pose
+    target_xy = target_pose[0][:2]
 
-    # Get object's room(s)
+    # Step 2: Determine valid rooms
     obj_rooms = obj.in_rooms if obj.in_rooms else [
         robot.scene._seg_map.get_room_instance_by_point(target_pose[0][:2])
     ]
-
     if verbose:
         print(f"  Object room(s): {obj_rooms}")
 
-    # Sampling parameters
-    distance_lo, distance_hi = 0.0, sampling_radius
-    yaw_lo, yaw_hi = -math.pi, math.pi
+    # Step 3: Generate candidate poses
     avg_arm_workspace_range = th.mean(robot.arm_workspace_range[arm])
-
     if verbose:
-        print(f"  Sampling distance range: [{distance_lo:.2f}, {distance_hi:.2f}]m")
+        print(f"  Sampling distance range: [0.00, {sampling_radius:.2f}]m")
         print(f"  Average arm workspace range: {avg_arm_workspace_range:.3f}")
-
-    # Update obstacles before sampling
-    controller._motion_generator.update_obstacles()
-
-    # ========================================================================
-    # Batch generation of all candidate 2D poses
-    # ========================================================================
-    if verbose:
         print(f"  Generating {max_samples} candidate poses...")
 
-    # Generate all random samples at once
-    distances = th.rand(max_samples) * (distance_hi - distance_lo) + distance_lo
-    yaws = th.rand(max_samples) * (yaw_hi - yaw_lo) + yaw_lo
+    controller._motion_generator.update_obstacles()
 
-    # Compute all candidate 2D poses: (max_samples, 3) -> [x, y, yaw]
-    candidate_2d_poses = th.stack([
-        target_pose[0][0] + distances * th.cos(yaws),
-        target_pose[0][1] + distances * th.sin(yaws),
-        yaws + math.pi - avg_arm_workspace_range,
-    ], dim=1)  # Shape: (max_samples, 3)
+    candidate_poses = generate_candidate_poses(
+        target_pos=target_pose[0],
+        num_samples=max_samples,
+        sampling_radius=sampling_radius,
+        arm_workspace_offset=avg_arm_workspace_range.item(),
+    )
 
-    # ========================================================================
-    # Room filter (must be done per-sample due to map query)
-    # ========================================================================
-    room_valid_mask = th.zeros(max_samples, dtype=th.bool)
-    for i in range(max_samples):
-        candidate_room = robot.scene._seg_map.get_room_instance_by_point(candidate_2d_poses[i, :2])
-        room_valid_mask[i] = candidate_room in obj_rooms
-
-    room_valid_indices = th.where(room_valid_mask)[0]
+    # Step 4: Filter by room
+    room_valid_poses, room_valid_indices = filter_poses_by_room(
+        poses=candidate_poses,
+        valid_rooms=obj_rooms,
+        scene_seg_map=robot.scene._seg_map,
+    )
     stats["room_failures"] = max_samples - len(room_valid_indices)
 
     if verbose:
@@ -367,50 +831,20 @@ def sample_pose_near_object(
     if len(room_valid_indices) == 0:
         if verbose:
             print(f"\n  [FAILED] All samples failed room check")
-        return SampledPoseResult(
-            pregrasp_pose=None,
-            grasp_pose=None,
-            base_pose_2d=None,
-            success=False,
-            stats=stats,
+        return GraspBasePoseResult(
+            pregrasp_pose=None, grasp_pose=None, base_pose_2d=None,
+            success=False, stats=stats,
         )
 
-    # ========================================================================
-    # Batch collision check
-    # ========================================================================
+    # Step 5: Convert to joint positions
     current_joint_pos = robot.get_joint_positions()
-    room_valid_poses = candidate_2d_poses[room_valid_indices]  # (N_valid, 3) - world coordinates [x, y, yaw]
+    batch_joint_positions = convert_poses_to_joint_positions(
+        poses=room_valid_poses,
+        robot=robot,
+        current_joint_pos=current_joint_pos,
+    )
 
-    # Build batch joint positions
-    batch_joint_positions = current_joint_pos.unsqueeze(0).repeat(len(room_valid_indices), 1)
-    
-    # For HolonomicBaseRobot, we need to convert world coordinates to joint values
-    # Joint values are relative to root_link, not absolute world coordinates
-    if isinstance(robot, HolonomicBaseRobot):
-        # Get root_link's world position (this is fixed)
-        root_pos, root_quat = robot.root_link.get_position_orientation()
-        
-        # For each candidate pose, compute the relative joint values
-        for i, pose_2d in enumerate(room_valid_poses):
-            # Construct full 3D target pose from 2D pose [x, y, yaw]
-            target_pos = th.tensor([pose_2d[0], pose_2d[1], root_pos[2]])  # Use root_link's z
-            target_quat = T.euler2quat(th.tensor([0.0, 0.0, pose_2d[2]]))  # Only yaw rotation
-            
-            # Compute relative transform from root_link to target
-            inv_root_pos, inv_root_quat = T.invert_pose_transform(root_pos, root_quat)
-            relative_pos, relative_quat = T.pose_transform(inv_root_pos, inv_root_quat, target_pos, target_quat)
-            
-            # Convert quaternion to euler angles (intrinsic xyz)
-            relative_euler = T.quat2euler(relative_quat)
-            
-            # Set joint positions: base_control_idx corresponds to [x, y, rz] joints
-            batch_joint_positions[i, robot.base_control_idx[0]] = relative_pos[0]  # x
-            batch_joint_positions[i, robot.base_control_idx[1]] = relative_pos[1]  # y
-            batch_joint_positions[i, robot.base_control_idx[2]] = relative_euler[2]  # rz (yaw)
-    else:
-        # For non-holonomic robots, directly use the 2D poses
-        batch_joint_positions[:, robot.base_control_idx] = room_valid_poses
-
+    # Step 6: Batch collision check
     obj_in_hand = controller._get_obj_in_hand()
     attached_obj = (
         {robot.eef_link_names[arm]: obj_in_hand.root_link}
@@ -420,29 +854,29 @@ def sample_pose_near_object(
     if verbose:
         print(f"  Running batch collision check for {len(room_valid_indices)} candidates...")
 
-    collision_results = controller._motion_generator.check_collisions(
-        batch_joint_positions,
-        self_collision_check=False,
-        skip_obstacle_update=True,
+    collision_results = batch_collision_check(
+        controller=controller,
+        batch_joint_positions=batch_joint_positions,
         attached_obj=attached_obj,
-    ).cpu()  # Shape: (N_valid,)
+    )
 
-    collision_free_mask = ~collision_results
-    collision_free_local_indices = th.where(collision_free_mask)[0]
+    collision_free_indices = th.where(~collision_results)[0]
     stats["collision_failures"] = int(collision_results.sum().item())
 
     if verbose:
-        print(f"  Collision filter: {len(collision_free_local_indices)}/{len(room_valid_indices)} passed")
+        print(f"  Collision filter: {len(collision_free_indices)}/{len(room_valid_indices)} passed")
 
-    # Collect collision failed poses and joint positions for visualization
-    collision_failed_poses = []
-    collision_failed_joint_positions = []
-    for i in range(len(room_valid_poses)):
-        if collision_results[i].item():
-            collision_failed_poses.append(room_valid_poses[i].clone())
-            collision_failed_joint_positions.append(batch_joint_positions[i].clone())
+    # Collect failed poses for visualization
+    collision_failed_poses = [
+        room_valid_poses[i].clone() for i in range(len(room_valid_poses))
+        if collision_results[i].item()
+    ]
+    collision_failed_joint_positions = [
+        batch_joint_positions[i].clone() for i in range(len(batch_joint_positions))
+        if collision_results[i].item()
+    ]
 
-    if len(collision_free_local_indices) == 0:
+    if len(collision_free_indices) == 0:
         stats["total_attempts"] = max_samples
         if verbose:
             print(f"\n  [FAILED] All samples failed collision check")
@@ -455,52 +889,96 @@ def sample_pose_near_object(
                 motion_generator=controller._motion_generator,
                 collision_joint_positions=collision_failed_joint_positions,
             )
-        return SampledPoseResult(
-            pregrasp_pose=None,
-            grasp_pose=None,
-            base_pose_2d=None,
-            success=False,
-            stats=stats,
+        return GraspBasePoseResult(
+            pregrasp_pose=None, grasp_pose=None, base_pose_2d=None,
+            success=False, stats=stats,
         )
 
-    # ========================================================================
-    # Reachability check (sequential, as IK solving is typically not batched)
-    # ========================================================================
-    reachability_failed_poses = []
-
+    # Step 7: Check reachability
     if verbose:
-        print(f"  Checking reachability for {len(collision_free_local_indices)} collision-free candidates...")
+        print(f"  Checking reachability for {len(collision_free_indices)} collision-free candidates...")
 
-    for local_idx in collision_free_local_indices:
-        candidate_2d_pose = room_valid_poses[local_idx]
-        joint_pos = batch_joint_positions[local_idx]
+    valid_poses, reachability_failed_poses, reachability_failures = check_reachability(
+        controller=controller,
+        poses=room_valid_poses,
+        batch_joint_positions=batch_joint_positions,
+        collision_free_indices=collision_free_indices,
+        target_pose=target_pose,
+        original_indices=room_valid_indices,
+        verbose=verbose,
+    )
+    stats["reachability_failures"] = reachability_failures
 
-        if controller._target_in_reach_of_robot(
-            target_pose, initial_joint_pos=joint_pos, skip_obstacle_update=True
-        ):
-            # Success! Found a valid pose
-            global_idx = room_valid_indices[local_idx].item()
-            stats["total_attempts"] = global_idx + 1
+    # Step 8: Select optimal pose
+    if valid_poses:
+        robot_pos, robot_quat = robot.get_position_orientation()
+        robot_xy = robot_pos[:2]
+        robot_yaw = T.quat2euler(robot_quat)[2].item()
 
-            if verbose:
-                print(f"\n  [SUCCESS] Found valid pose (sample {global_idx})")
-                print(f"    Collision failures: {stats['collision_failures']}")
-                print(f"    Reachability failures: {stats['reachability_failures']}")
-                print(f"    Room failures: {stats['room_failures']}")
-                print(f"    Valid pose: ({candidate_2d_pose[0].item():.3f}, {candidate_2d_pose[1].item():.3f}, {candidate_2d_pose[2].item():.3f})")
+        best_pose, best_idx, best_traj_info = select_optimal_pose(
+            valid_poses=valid_poses,
+            target_xy=target_xy,
+            robot_xy=robot_xy,
+            robot_yaw=robot_yaw,
+            controller=controller,
+            robot=robot,
+            verbose=verbose,
+        )
 
-            return SampledPoseResult(
-                pregrasp_pose=eef_pose,
-                grasp_pose=grasp_pose,
-                base_pose_2d=candidate_2d_pose,
-                success=True,
-                stats=stats,
+        # Compute final stats
+        best_travel_dist = th.norm(best_pose[:2] - robot_xy).item()
+        best_yaw_change = abs(wrap_angle(best_pose[2].item() - robot_yaw))
+        best_dist_to_target = th.norm(best_pose[:2] - target_xy).item()
+        target_direction = th.atan2(
+            target_xy[1] - best_pose[1],
+            target_xy[0] - best_pose[0]
+        ).item()
+        best_facing_error = abs(wrap_angle(best_pose[2].item() - target_direction))
+
+        stats["total_attempts"] = max_samples
+
+        if verbose:
+            print(f"\n  [SUCCESS] Selected optimal pose based on trajectory complexity")
+            print(f"    Collision failures: {stats['collision_failures']}")
+            print(f"    Reachability failures: {stats['reachability_failures']}")
+            print(f"    Room failures: {stats['room_failures']}")
+            print(f"    Selected pose: ({best_pose[0].item():.3f}, {best_pose[1].item():.3f}, "
+                  f"{best_pose[2].item():.3f})")
+            print(f"    Distance to target: {best_dist_to_target:.3f}m "
+                  f"(optimal: {OPTIMAL_DIST_MIN:.1f}-{OPTIMAL_DIST_MAX:.1f}m)")
+            print(f"    Straight-line: {best_travel_dist:.3f}m, End rotation: "
+                  f"{math.degrees(best_yaw_change):.1f}deg, Facing error: "
+                  f"{math.degrees(best_facing_error):.1f}deg")
+            if best_traj_info:
+                print(f"    Actual trajectory: path={best_traj_info[0]:.3f}m, "
+                      f"cumulative rotation={math.degrees(best_traj_info[1]):.1f}deg, "
+                      f"waypoints={best_traj_info[2]}")
+
+        # Visualize all poses if requested
+        if visualize:
+            viz_data = PoseVisualizationData(
+                collision_failed_poses=collision_failed_poses,
+                reachability_failed_poses=reachability_failed_poses,
+                valid_poses=[pose for pose, _ in valid_poses],
+                selected_pose=best_pose,
+                target_position=target_xy,
+                collision_joint_positions=collision_failed_joint_positions,
             )
-        else:
-            stats["reachability_failures"] += 1
-            reachability_failed_poses.append(candidate_2d_pose.clone())
-            if verbose and len(reachability_failed_poses) <= MAX_VERBOSE_SAMPLES:
-                print(f"    Sample {room_valid_indices[local_idx].item()}: Not reachable at ({candidate_2d_pose[0].item():.2f}, {candidate_2d_pose[1].item():.2f})")
+            visualize_all_candidate_poses(
+                robot=robot,
+                viz_data=viz_data,
+                max_display_per_category=MAX_VERBOSE_SAMPLES,
+                motion_generator=controller._motion_generator,
+                show_collision_spheres=False,
+            )
+
+        return GraspBasePoseResult(
+            pregrasp_pose=eef_pose,
+            grasp_pose=grasp_pose,
+            base_pose_2d=best_pose,
+            success=True,
+            stats=stats,
+        )
 
     # Sampling failed
     stats["total_attempts"] = max_samples
@@ -510,16 +988,24 @@ def sample_pose_near_object(
         print(f"    Reachability failures: {stats['reachability_failures']}")
         print(f"    Room failures: {stats['room_failures']}")
 
-    # Visualize failed poses if requested
     if visualize:
-        _visualize_failed_poses(
-            robot, collision_failed_poses, reachability_failed_poses,
-            max_display=MAX_VERBOSE_SAMPLES,
-            motion_generator=controller._motion_generator,
+        viz_data = PoseVisualizationData(
+            collision_failed_poses=collision_failed_poses,
+            reachability_failed_poses=reachability_failed_poses,
+            valid_poses=[],
+            selected_pose=None,
+            target_position=target_xy,
             collision_joint_positions=collision_failed_joint_positions,
         )
+        visualize_all_candidate_poses(
+            robot=robot,
+            viz_data=viz_data,
+            max_display_per_category=MAX_VERBOSE_SAMPLES,
+            motion_generator=controller._motion_generator,
+            show_collision_spheres=True,
+        )
 
-    return SampledPoseResult(
+    return GraspBasePoseResult(
         pregrasp_pose=None,
         grasp_pose=None,
         base_pose_2d=None,
@@ -625,6 +1111,174 @@ def plan_navigation(
     return q_traj
 
 
+@dataclass
+class PoseVisualizationData:
+    """Data container for pose visualization."""
+    collision_failed_poses: List[th.Tensor] = None
+    reachability_failed_poses: List[th.Tensor] = None
+    valid_poses: List[th.Tensor] = None
+    selected_pose: Optional[th.Tensor] = None
+    target_position: Optional[th.Tensor] = None
+    collision_joint_positions: Optional[List[th.Tensor]] = None
+    
+    def __post_init__(self):
+        if self.collision_failed_poses is None:
+            self.collision_failed_poses = []
+        if self.reachability_failed_poses is None:
+            self.reachability_failed_poses = []
+        if self.valid_poses is None:
+            self.valid_poses = []
+
+
+# Visualization color scheme
+class PoseColors:
+    """Color constants for pose visualization (RGBA)."""
+    ROBOT_CURRENT = (0.0, 0.5, 1.0, 1.0)      # Blue - robot's current pose
+    COLLISION_FAILED = (1.0, 0.2, 0.2, 0.6)   # Red - collision failures
+    REACHABILITY_FAILED = (1.0, 0.6, 0.0, 0.6) # Orange - reachability failures
+    VALID = (0.2, 0.8, 0.2, 0.7)              # Green - valid poses
+    SELECTED = (0.8, 0.0, 0.8, 1.0)           # Purple - selected optimal pose
+    TARGET = (1.0, 1.0, 0.0, 1.0)             # Yellow - target object position
+
+
+def visualize_all_candidate_poses(
+    robot,
+    viz_data: PoseVisualizationData,
+    z_height: float = 0.1,
+    max_display_per_category: int = 20,
+    motion_generator=None,
+    show_collision_spheres: bool = True,
+) -> None:
+    """
+    Visualize all candidate poses with different colors for each category.
+
+    Color scheme:
+    - Blue (large arrow): Robot's current pose
+    - Red (small arrows): Collision failures
+    - Orange (small arrows): Reachability failures  
+    - Green (medium arrows): Valid poses (passed all checks)
+    - Purple (large arrow + box): Selected optimal pose
+    - Yellow (box): Target object position
+
+    Args:
+        robot: Robot object for visualizing current robot pose.
+        viz_data: PoseVisualizationData containing all pose categories.
+        z_height: Base Z-coordinate for visualization.
+        max_display_per_category: Maximum poses to display per category.
+        motion_generator: Optional CuRoboMotionGenerator for sphere visualization.
+        show_collision_spheres: Whether to show collision spheres for first failure.
+    """
+    counts = {
+        "collision_failed": 0,
+        "reachability_failed": 0,
+        "valid": 0,
+    }
+
+    # 1. Visualize target position (yellow box)
+    if viz_data.target_position is not None:
+        target_xy = viz_data.target_position[:2]
+        draw_box(
+            center=[target_xy[0].item(), target_xy[1].item(), z_height],
+            extents=[0.15, 0.15, 0.02],
+            color=PoseColors.TARGET,
+            size=3.0,
+        )
+
+    # 2. Visualize robot's current pose (blue, large arrow)
+    robot_pos, robot_quat = robot.get_position_orientation()
+    robot_yaw = T.quat2euler(robot_quat)[2].item()
+    robot_2d_pose = th.tensor([robot_pos[0], robot_pos[1], robot_yaw])
+    visualize_2d_pose(
+        robot_2d_pose, 
+        z_height=z_height + 0.05, 
+        arrow_length=0.5,
+        color=PoseColors.ROBOT_CURRENT, 
+        verbose=False
+    )
+
+    # 3. Visualize collision failed poses (red, small arrows)
+    collision_to_show = viz_data.collision_failed_poses[:max_display_per_category]
+    for i, pose in enumerate(collision_to_show):
+        visualize_2d_pose(
+            pose,
+            z_height=z_height,
+            arrow_length=0.2,
+            color=PoseColors.COLLISION_FAILED,
+            verbose=False,
+        )
+    counts["collision_failed"] = len(collision_to_show)
+
+    # 4. Visualize reachability failed poses (orange, small arrows)
+    reachability_to_show = viz_data.reachability_failed_poses[:max_display_per_category]
+    for i, pose in enumerate(reachability_to_show):
+        visualize_2d_pose(
+            pose,
+            z_height=z_height + 0.01,
+            arrow_length=0.2,
+            color=PoseColors.REACHABILITY_FAILED,
+            verbose=False,
+        )
+    counts["reachability_failed"] = len(reachability_to_show)
+
+    # 5. Visualize valid poses (green, medium arrows)
+    valid_to_show = viz_data.valid_poses[:max_display_per_category]
+    for i, pose in enumerate(valid_to_show):
+        visualize_2d_pose(
+            pose,
+            z_height=z_height + 0.02,
+            arrow_length=0.35,
+            color=PoseColors.VALID,
+            verbose=False,
+        )
+    counts["valid"] = len(valid_to_show)
+
+    # 6. Visualize selected optimal pose (purple, large arrow + highlighted box)
+    if viz_data.selected_pose is not None:
+        selected = viz_data.selected_pose
+        # Draw highlighted box at selected position
+        draw_box(
+            center=[selected[0].item(), selected[1].item(), z_height + 0.03],
+            extents=[0.2, 0.2, 0.02],
+            color=PoseColors.SELECTED,
+            size=3.0,
+        )
+        # Draw large arrow for selected pose
+        visualize_2d_pose(
+            selected,
+            z_height=z_height + 0.04,
+            arrow_length=0.5,
+            color=PoseColors.SELECTED,
+            verbose=False,
+        )
+
+    # 7. Optionally show collision spheres for first collision failure
+    if (show_collision_spheres and motion_generator is not None and 
+        viz_data.collision_joint_positions and len(viz_data.collision_joint_positions) > 0):
+        print(f"\n  Visualizing collision spheres for first collision failure...")
+        visualize_robot_spheres_at_config(
+            motion_generator=motion_generator,
+            joint_positions=viz_data.collision_joint_positions[0],
+            verbose=True,
+        )
+
+    # Print legend
+    print(f"\n  === Pose Visualization Legend ===")
+    print(f"    Blue arrow      : Robot current pose")
+    print(f"    Yellow box      : Target object position")
+    print(f"    Red arrows   ({counts['collision_failed']:3d}): Collision failures")
+    print(f"    Orange arrows({counts['reachability_failed']:3d}): Reachability failures")
+    print(f"    Green arrows ({counts['valid']:3d}): Valid poses")
+    if viz_data.selected_pose is not None:
+        print(f"    Purple arrow    : Selected optimal pose")
+    
+    total_shown = counts['collision_failed'] + counts['reachability_failed'] + counts['valid']
+    total_actual = (len(viz_data.collision_failed_poses) + 
+                   len(viz_data.reachability_failed_poses) + 
+                   len(viz_data.valid_poses))
+    if total_shown < total_actual:
+        print(f"\n    (Showing {total_shown}/{total_actual} poses, limit={max_display_per_category} per category)")
+
+
 def _visualize_failed_poses(
     robot,
     collision_poses: List[th.Tensor],
@@ -635,11 +1289,10 @@ def _visualize_failed_poses(
     collision_joint_positions: Optional[List[th.Tensor]] = None,
 ) -> None:
     """
-    Visualize failed candidate poses for debugging.
+    Visualize failed candidate poses for debugging (legacy interface).
 
-    Uses visualize_2d_pose to show position and orientation (with arrows).
-    Red = collision failures, Green = reachability failures.
-    Optionally shows collision spheres for the first collision failure.
+    This is a simplified wrapper around visualize_all_candidate_poses for
+    backward compatibility.
 
     Args:
         robot: Robot object for visualizing current robot pose.
@@ -650,52 +1303,21 @@ def _visualize_failed_poses(
         motion_generator: Optional CuRoboMotionGenerator for sphere visualization.
         collision_joint_positions: Optional list of joint positions for collision failures.
     """
-    # Visualize robot's current pose (blue)
-    robot_pos, robot_quat = robot.get_position_orientation()
-    robot_yaw = T.quat2euler(robot_quat)[2].item()
-    robot_2d_pose = th.tensor([robot_pos[0], robot_pos[1], robot_yaw])
-    visualize_2d_pose(robot_2d_pose, z_height=z_height, color=(0.0, 0.5, 1.0, 1.0), verbose=False)
-
-    # Red: collision failures (with arrows showing orientation)
-    for i, pose in enumerate(collision_poses[:max_display]):
-        visualize_2d_pose(
-            pose,
-            z_height=z_height + 0.01 * i,  # Slight offset to avoid overlap
-            arrow_length=0.3,
-            color=(1.0, 0.0, 0.0, 0.8),  # Red
-            verbose=False,
-        )
-
-    # Green: reachability failures (with arrows showing orientation)
-    for i, pose in enumerate(reachability_poses[:max_display]):
-        visualize_2d_pose(
-            pose,
-            z_height=z_height + 0.01 * (i + max_display),  # Offset after collision poses
-            arrow_length=0.3,
-            color=(0.0, 1.0, 0.0, 0.8),  # Green
-            verbose=False,
-        )
-
-    # Visualize collision spheres for first collision failure (shows WHY it's a collision)
-    if motion_generator is not None and collision_joint_positions and len(collision_joint_positions) > 0:
-        print(f"\n  Visualizing collision spheres for first collision failure...")
-        print(f"  (Red boxes = robot collision spheres at sampled position)")
-        visualize_robot_spheres_at_config(
-            motion_generator=motion_generator,
-            joint_positions=collision_joint_positions[0],
-            verbose=True,
-        )
-
-    print(f"\n  Visualization legend:")
-    print(f"    Blue arrow = Robot current pose")
-    print(f"    Red arrows ({len(collision_poses[:max_display])}) = Collision failures")
-    print(f"    Green arrows ({len(reachability_poses[:max_display])}) = Reachability failures")
-    if motion_generator is not None and collision_joint_positions:
-        print(f"    Red boxes = Robot collision spheres at first collision failure")
-
-    # Allow user to move camera more easily
+    viz_data = PoseVisualizationData(
+        collision_failed_poses=collision_poses,
+        reachability_failed_poses=reachability_poses,
+        collision_joint_positions=collision_joint_positions,
+    )
+    
+    visualize_all_candidate_poses(
+        robot=robot,
+        viz_data=viz_data,
+        z_height=z_height,
+        max_display_per_category=max_display,
+        motion_generator=motion_generator,
+        show_collision_spheres=(collision_joint_positions is not None),
+    )
     og.sim.enable_viewer_camera_teleoperation()
-    # Keep simulation running for visualization inspection
     print(f"\n  Press Ctrl+C to exit visualization...")
     try:
         while True:

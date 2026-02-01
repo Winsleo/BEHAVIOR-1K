@@ -260,6 +260,11 @@ def visualize_sampling_region(
     """
     center = eef_pose[0]
 
+    # Purple color scheme
+    color_boundary = (0.6, 0.4, 0.8, 0.8)   # Light purple for boundary
+    color_center = (0.5, 0.0, 0.5, 1.0)     # Dark purple for center
+    color_object = (0.8, 0.4, 0.8, 1.0)     # Magenta for object
+
     # Draw sampling region boundary (circle approximated with line segments)
     num_points = 24
     for i in range(num_points):
@@ -277,13 +282,13 @@ def visualize_sampling_region(
             z_height,
         )
 
-        draw_line(p1, p2, color=(1.0, 0.5, 0.0, 0.8), size=DEFAULT_BOX_SIZE)
+        draw_line(p1, p2, color=color_boundary, size=DEFAULT_BOX_SIZE)
 
     # Draw center point (grasp target)
     draw_box(
         center=[_to_scalar(center[0]), _to_scalar(center[1]), z_height],
         extents=[0.1, 0.1, 0.02],
-        color=COLOR_RED,
+        color=color_center,
         size=DEFAULT_BOX_SIZE,
     )
 
@@ -292,7 +297,7 @@ def visualize_sampling_region(
     draw_box(
         center=[_to_scalar(obj_pos[0]), _to_scalar(obj_pos[1]), z_height + 0.02],
         extents=[0.15, 0.15, 0.02],
-        color=COLOR_GREEN,
+        color=color_object,
         size=DEFAULT_BOX_SIZE,
     )
 
@@ -311,7 +316,7 @@ def visualize_2d_pose(
     verbose: bool = True,
 ) -> None:
     """
-    Visualize a 2D pose returned by _sample_pose_near_object.
+    Visualize a 2D base pose for robot navigation.
 
     Draws an arrow indicating position and orientation, with a box at the base position.
 
@@ -368,7 +373,7 @@ def visualize_robot_and_sampled_pose(
 
     Args:
         robot: Robot object.
-        sampled_pose: (x, y, yaw) tensor from _sample_pose_near_object.
+        sampled_pose: (x, y, yaw) tensor representing target base pose.
         z_height: Z-coordinate height for visualization.
         verbose: Whether to print pose and distance information.
     """
