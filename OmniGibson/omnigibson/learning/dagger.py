@@ -227,15 +227,30 @@ def navigate_and_grasp(
         print(f"[Step 5/5] Executing grasp")
         print(f"{'='*50}")
 
-    for action in controller._execute_grasp():
+    # 1. Open gripper first
+    for action in controller._execute_release():
         env.step(action)
 
-    # Move to final grasp pose
+    # 2. Move to grasp position
     for action in controller._move_hand(
         grasp_pose,
         motion_constraint=[1, 1, 1, 1, 1, 0],
         stop_on_ag=True,
         ignore_objects=[obj],
+    ):
+        env.step(action)
+
+    # 3. Close gripper to grasp
+    for action in controller._execute_grasp():
+        env.step(action)
+
+    # 4. Lift object and restore to pre-grasp pose
+    # Use _move_hand_linearly_cartesian to avoid CuRobo attach_objects_to_robot
+    # (which can fail with NoneType mesh for some grasped objects)
+    for action in controller._move_hand_linearly_cartesian(
+        pregrasp_pose,
+        stop_on_contact=True,
+        ignore_failure=True,
     ):
         env.step(action)
 
