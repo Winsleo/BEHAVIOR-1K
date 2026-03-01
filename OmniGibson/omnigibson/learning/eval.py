@@ -37,7 +37,6 @@ from omnigibson.learning.utils.obs_utils import (
 )
 from omnigibson.macros import gm, create_module_macros, macros
 from omnigibson.metrics import MetricBase, AgentMetric, TaskMetric
-from omnigibson.robots import BaseRobot
 from omnigibson.utils.asset_utils import get_task_instance_path
 from omnigibson.utils.python_utils import recursively_convert_to_torch
 from pathlib import Path
@@ -157,11 +156,11 @@ class Evaluator:
         env = instantiate(env_wrapper, env=env)
         return env
 
-    def load_robot(self) -> BaseRobot:
+    def load_robot(self):
         """
         Loads and returns the robot instance from the environment.
         Returns:
-            BaseRobot: The robot instance loaded from the environment.
+            The robot instance loaded from the environment.
         """
         robot = self.env.scene.object_registry("name", "robot_r1")
         return robot
