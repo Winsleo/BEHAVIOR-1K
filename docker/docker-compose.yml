@@ -1,0 +1,40 @@
+# OmniGibson data root: /behavior-src/datasets
+# Cache directories: ${DATA_PATH:-../datasets}/isaac-sim/cache/
+# Use OMNIGIBSON_HEADLESS=1 for headless mode
+
+services:
+  behavior-1k:
+    image: stanfordvl/behavior-dev:main
+    container_name: behavior-1k
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - DISPLAY=${DISPLAY:-}
+      - OMNIGIBSON_DATA_PATH=/behavior-src/datasets
+      - OMNI_KIT_ACCEPT_EULA=YES
+      - OMNIGIBSON_HEADLESS=${OMNIGIBSON_HEADLESS:-0}
+    volumes:
+      - ../:/behavior-src:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/cache/kit:/isaac-sim/kit/cache/Kit:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/cache/ov:/root/.cache/ov:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/cache/pip:/root/.cache/pip:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/cache/glcache:/root/.cache/nvidia/GLCache:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/cache/computecache:/root/.nv/ComputeCache:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/config:/root/.nvidia-omniverse/config:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/data:/root/.local/share/ov/data:rw
+      - ${DATA_PATH:-../datasets}/isaac-sim/documents:/root/Documents:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    working_dir: /behavior-src
+    # shm_size: '16g'  # Uncomment if PyTorch multiprocessing causes "Bus error"
+    stdin_open: true
+    tty: true
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: /bin/bash
