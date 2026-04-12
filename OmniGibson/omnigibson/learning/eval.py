@@ -15,7 +15,6 @@ from av.stream import Stream
 from gello.utils.og_teleop_utils import (
     augment_rooms,
     load_available_tasks,
-    generate_robot_config,
     get_task_relevant_room_types,
 )
 from gello.utils.og_teleop_cfg import DISABLED_TRANSITION_RULES
@@ -30,13 +29,17 @@ from omnigibson.learning.utils.eval_utils import (
     flatten_obs_dict,
     TASK_NAMES_TO_INDICES,
 )
+from omnigibson.learning.utils.robot_config_utils import (
+    build_r1pro_primitives_robot_config,
+    resolve_presampled_robot_pose,
+)
 from omnigibson.learning.utils.obs_utils import (
     create_video_writer,
     write_video,
 )
 from omnigibson.macros import gm, create_module_macros, macros
 from omnigibson.metrics import MetricBase, AgentMetric, TaskMetric
-from omnigibson.robots import BaseRobot
+from omnigibson.robots import Robot
 from omnigibson.utils.asset_utils import get_task_instance_path
 from omnigibson.utils.bddl_utils import is_system_bddl_inst
 from omnigibson.utils.python_utils import recursively_convert_to_torch
@@ -82,8 +85,8 @@ class Evaluator:
         self.robot_action = dict()
 
         self.env = self.load_env(env_wrapper=self.cfg.env_wrapper)
-        self.policy = self.load_policy()
         self.robot = self.load_robot()
+        self.policy = self.load_policy()
         self.metrics = self.load_metrics()
 
         self.reset()
@@ -132,16 +135,14 @@ class Evaluator:
             cfg["scene"]["load_room_types"] = relevant_rooms
 
         cfg["robots"] = [
-            generate_robot_config(
-                task_name=task_name,
-                task_cfg=task_cfg,
+            build_r1pro_primitives_robot_config(
+                task_cfg,
+                robot_name="robot_r1",
+                obs_modalities=["proprio", "rgb"],
+                proprio_obs=list(PROPRIOCEPTION_INDICES["R1Pro"].keys()),
+                controller_overrides=self.cfg.robot.controllers,
             )
         ]
-        # Update observation modalities
-        cfg["robots"][0]["obs_modalities"] = ["proprio", "rgb"]
-        cfg["robots"][0]["proprio_obs"] = list(PROPRIOCEPTION_INDICES["R1Pro"].keys())
-        if self.cfg.robot.controllers is not None:
-            cfg["robots"][0]["controller_config"].update(self.cfg.robot.controllers)
         if self.cfg.max_steps is None:
             logger.info(
                 f"Setting timeout to be 2x the average length of human demos: {int(self.human_stats['length'] * 2)}"
@@ -156,11 +157,11 @@ class Evaluator:
         env = instantiate(env_wrapper, env=env)
         return env
 
-    def load_robot(self) -> BaseRobot:
+    def load_robot(self) -> Robot:
         """
         Loads and returns the robot instance from the environment.
         Returns:
-            BaseRobot: The robot instance loaded from the environment.
+            Robot: The robot instance loaded from the environment.
         """
         robot = self.env.scene.object_registry("name", "robot_r1")
         return robot
@@ -170,6 +171,8 @@ class Evaluator:
         Loads and returns the policy instance.
         """
         policy = instantiate(self.cfg.model)
+        if hasattr(policy, "setup"):
+            policy.setup(env=self.env, robot=self.robot, task_name=self.cfg.task.name)
         logger.info("")
         logger.info("=" * 50)
         logger.info(f"Loaded policy: {self.cfg.policy_name}")
@@ -204,8 +207,9 @@ class Evaluator:
             6. Returns the termination and truncation status.
         """
         self.robot_action = self.policy.forward(obs=self.obs)
+        env_action = self.policy.to_env_action(self.robot_action) if hasattr(self.policy, "to_env_action") else self.robot_action
 
-        obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        obs, _, terminated, truncated, info = self.env.step(env_action, n_render_iterations=1)
 
         # process obs
         self.obs = self._preprocess_obs(obs)
@@ -270,18 +274,15 @@ class Evaluator:
             tro_state = recursively_convert_to_torch(json.load(f))
         for tro_key, tro_state in tro_state.items():
             if tro_key == "robot_poses":
-                presampled_robot_poses = tro_state
-                # make all lowercase
-                presampled_robot_poses = {k.lower(): v for k, v in presampled_robot_poses.items()}
-                # use generic "robot" key if it exists, otherwise look for model-specific key
+                presampled_robot_poses = {k.lower(): v for k, v in tro_state.items()}
                 if "robot" in presampled_robot_poses:
                     available_poses = presampled_robot_poses["robot"]
-                elif self.robot.model in presampled_robot_poses:
-                    print("No generic presampled robot pose found, using robot-specific pose.")
-                    available_poses = presampled_robot_poses[self.robot.model]
                 else:
-                    raise KeyError(f"No generic or model-specific presampled robot pose found for {self.robot.model}!")
-                self.robot.set_position_orientation(available_poses[0]["position"], available_poses[0]["orientation"])
+                    available_poses = resolve_presampled_robot_pose(tro_state, self.robot.model)
+
+                robot_pos = available_poses[0]["position"]
+                robot_quat = available_poses[0]["orientation"]
+                self.robot.set_position_orientation(robot_pos, robot_quat)
                 # Write robot poses to scene metadata
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_state)
             else:

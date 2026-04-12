@@ -1,0 +1,16 @@
+# @package _global_
+
+policy_name: task_primitives_expert
+
+model:
+  _target_: omnigibson.learning.policies.TaskPrimitivesExpertPolicy
+  action_dim: null
+  grasp_mode: custom
+  max_samples: 50
+  primitive_attempts: 5
+  object_name: null
+  task_object_overrides:
+    turning_on_radio: radio_89
+  verbose: false
+  visualize: false
+  action_mode: velocity
