@@ -53,7 +53,7 @@ from omnigibson.learning.task_primitives.runtime import (
     warmup_environment,
 )
 from omnigibson.learning.task_primitives.registry import DEFAULT_TASK_SPECS, TaskPrimitiveSpec, resolve_task_spec
-from omnigibson.learning.task_primitives.tasks import BaseTask, NavigateAndGraspTask
+from omnigibson.learning.task_primitives.tasks import BaseTask, GraspAndPlaceInsideTask, NavigateAndGraspTask
 
 __all__ = [
     "ActionContext",
@@ -66,6 +66,7 @@ __all__ = [
     "ConsoleObserver",
     "FallbackGraspBackend",
     "GraspBasePoseResult",
+    "GraspAndPlaceInsideTask",
     "GraspDebugSnapshot",
     "GraspExecutionConfig",
     "GraspResult",

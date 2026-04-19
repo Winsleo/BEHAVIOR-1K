@@ -146,7 +146,9 @@ def load_env(task_name: str = "turning_on_radio", headless: bool = False):
     return env
 
 
-def resolve_scene_object(scene, object_name: str):
+def resolve_scene_object(scene, object_name: str, task=None):
+    if task is not None and object_name in task.object_scope:
+        return task.object_scope[object_name]
     obj = scene.object_registry("name", object_name)
     if obj is None:
         raise ValueError(f"Object '{object_name}' not found in scene")

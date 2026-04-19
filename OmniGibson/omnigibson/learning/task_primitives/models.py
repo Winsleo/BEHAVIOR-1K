@@ -24,6 +24,7 @@ class GraspResult(Enum):
     SAMPLING_FAILED = "sampling_failed"
     NAVIGATION_FAILED = "navigation_failed"
     GRASP_FAILED = "grasp_failed"
+    PLACE_FAILED = "place_failed"
 
 
 class SamplingStrategy(Enum):

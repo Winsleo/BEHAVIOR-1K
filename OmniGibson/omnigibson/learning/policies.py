@@ -5,6 +5,7 @@ from omnigibson.action_primitives.action_primitive_set_base import ActionPrimiti
 from omnigibson.learning.task_primitives import (
     CustomGraspBackend,
     FallbackGraspBackend,
+    GraspAndPlaceInsideTask,
     GraspExecutionConfig,
     NavigateAndGraspTask,
     PrimitiveGraspBackend,
@@ -111,6 +112,8 @@ class TaskPrimitivesExpertPolicy:
         primitive_attempts: int = 5,
         object_name: Optional[str] = None,
         task_object_overrides: Optional[Mapping[str, str] | DictConfig] = None,
+        target_name: Optional[str] = None,
+        task_target_overrides: Optional[Mapping[str, str] | DictConfig] = None,
         verbose: bool = False,
         visualize: bool = False,
         action_mode: str = "position",
@@ -122,6 +125,8 @@ class TaskPrimitivesExpertPolicy:
         self.primitive_attempts = primitive_attempts
         self.object_name = object_name
         self.task_object_overrides = dict(OmegaConf.to_container(task_object_overrides, resolve=True)) if isinstance(task_object_overrides, DictConfig) else dict(task_object_overrides or {})
+        self.target_name = target_name
+        self.task_target_overrides = dict(OmegaConf.to_container(task_target_overrides, resolve=True)) if isinstance(task_target_overrides, DictConfig) else dict(task_target_overrides or {})
         self.verbose = verbose
         self.visualize = visualize
         if action_mode not in {"position", "velocity"}:
@@ -174,10 +179,19 @@ class TaskPrimitivesExpertPolicy:
     def _build_task(self):
         """Resolve the task registry entry only when the first action is requested."""
         object_name = self.object_name or self.task_object_overrides.get(self.task_name)
-        spec = resolve_task_spec(self.task_name, object_name=object_name)
-        if spec.task_type != "navigate_and_grasp":
-            raise ValueError(f"Unsupported task_primitives expert task_type: {spec.task_type}")
-        return NavigateAndGraspTask(object_name=spec.object_name, backend=self._backend)
+        target_name = self.target_name or self.task_target_overrides.get(self.task_name)
+        spec = resolve_task_spec(self.task_name, object_name=object_name, target_name=target_name)
+        if spec.task_type == "navigate_and_grasp":
+            return NavigateAndGraspTask(object_name=spec.object_name, backend=self._backend)
+        if spec.task_type == "grasp_and_place_inside":
+            if spec.target_name is None:
+                raise ValueError(f"Task '{self.task_name}' requires a target_name for place-inside execution.")
+            return GraspAndPlaceInsideTask(
+                object_name=spec.object_name,
+                target_name=spec.target_name,
+                backend=self._backend,
+            )
+        raise ValueError(f"Unsupported task_primitives expert task_type: {spec.task_type}")
 
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
         if self.context is None:

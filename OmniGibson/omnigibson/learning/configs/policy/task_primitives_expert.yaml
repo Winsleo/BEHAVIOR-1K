@@ -11,6 +11,10 @@ model:
   object_name: null
   task_object_overrides:
     turning_on_radio: radio_89
+    picking_up_trash: can__of__soda.n.01_2
+  target_name: null
+  task_target_overrides:
+    picking_up_trash: ashcan.n.01_1
   verbose: false
   visualize: false
   action_mode: velocity
