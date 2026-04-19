@@ -22,6 +22,7 @@ from omnigibson.learning.utils.robot_config_utils import (
 from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES, generate_basic_environment_config
 from omnigibson.macros import gm
 from omnigibson.utils.asset_utils import get_task_instance_path
+from omnigibson.utils.bddl_utils import is_system_bddl_inst
 from omnigibson.utils.python_utils import recursively_convert_to_torch
 
 
@@ -93,10 +94,12 @@ def load_task_instance(env, robot, instance_id: int, test_hidden: bool = False) 
     if test_hidden:
         tro_file_path = os.path.join(gm.DATA_PATH, "2025-challenge-test-instances", env.task.activity_name, f"{tro_filename}-tro_state.json")
     else:
-        task_instance_root = get_task_instance_path(scene_model)
-        if task_instance_root is None:
-            raise FileNotFoundError(f"Task instance path not found for scene: {scene_model}")
-        tro_file_path = os.path.join(task_instance_root, f"json/{scene_model}_task_{env.task.activity_name}_instances/{tro_filename}-tro_state.json")
+        tro_file_path = os.path.join(
+            get_task_instance_path(
+                scene_model,
+                f"{scene_model}_task_{env.task.activity_name}_instances/{tro_filename}-tro_state",
+            )
+        )
     with open(tro_file_path, "r") as file:
         tro_state = recursively_convert_to_torch(json.load(file))
     for tro_key, state in tro_state.items():
@@ -110,8 +113,8 @@ def load_task_instance(env, robot, instance_id: int, test_hidden: bool = False) 
             env.task.object_scope[tro_key].load_state(state, serialized=False)
     for _ in range(25):
         og.sim.step_physics()
-        for entity in env.task.object_scope.values():
-            if not entity.is_system and entity.exists:
+        for inst, entity in env.task.object_scope.items():
+            if not is_system_bddl_inst(inst) and entity is not None:
                 entity.keep_still()
     env.scene.update_initial_file()
     env.scene.reset()
