@@ -1,22 +1,19 @@
 import logging
 import torch as th
-from omegaconf import DictConfig, OmegaConf
 from omnigibson.action_primitives.action_primitive_set_base import ActionPrimitiveError, ActionPrimitiveErrorGroup
 from omnigibson.learning.task_primitives import (
     CustomGraspBackend,
     FallbackGraspBackend,
-    GraspAndPlaceInsideTask,
     GraspExecutionConfig,
-    NavigateAndGraspTask,
     PrimitiveGraspBackend,
     create_action_context,
-    report_grasp_debug_context,
 )
-from omnigibson.learning.task_primitives.registry import resolve_task_spec
+from omnigibson.learning.task_primitives.bddl_task_planner import plan_from_goal
+from omnigibson.learning.task_primitives.tasks import BDDLSequenceTask
 from omnigibson.learning.utils.array_tensor_utils import torch_to_numpy
 from omnigibson.learning.utils.action_adapter import VelocityActionAdapter
 from omnigibson.learning.utils.network_utils import WebsocketClientPolicy
-from typing import Mapping, Optional
+from typing import Optional
 
 
 __all__ = [
@@ -110,10 +107,6 @@ class TaskPrimitivesExpertPolicy:
         grasp_mode: str = "custom",
         max_samples: int = 50,
         primitive_attempts: int = 5,
-        object_name: Optional[str] = None,
-        task_object_overrides: Optional[Mapping[str, str] | DictConfig] = None,
-        target_name: Optional[str] = None,
-        task_target_overrides: Optional[Mapping[str, str] | DictConfig] = None,
         verbose: bool = False,
         visualize: bool = False,
         action_mode: str = "position",
@@ -123,10 +116,6 @@ class TaskPrimitivesExpertPolicy:
         self.grasp_mode = grasp_mode
         self.max_samples = max_samples
         self.primitive_attempts = primitive_attempts
-        self.object_name = object_name
-        self.task_object_overrides = dict(OmegaConf.to_container(task_object_overrides, resolve=True)) if isinstance(task_object_overrides, DictConfig) else dict(task_object_overrides or {})
-        self.target_name = target_name
-        self.task_target_overrides = dict(OmegaConf.to_container(task_target_overrides, resolve=True)) if isinstance(task_target_overrides, DictConfig) else dict(task_target_overrides or {})
         self.verbose = verbose
         self.visualize = visualize
         if action_mode not in {"position", "velocity"}:
@@ -177,21 +166,21 @@ class TaskPrimitivesExpertPolicy:
         return normalized
 
     def _build_task(self):
-        """Resolve the task registry entry only when the first action is requested."""
-        object_name = self.object_name or self.task_object_overrides.get(self.task_name)
-        target_name = self.target_name or self.task_target_overrides.get(self.task_name)
-        spec = resolve_task_spec(self.task_name, object_name=object_name, target_name=target_name)
-        if spec.task_type == "navigate_and_grasp":
-            return NavigateAndGraspTask(object_name=spec.object_name, backend=self._backend)
-        if spec.task_type == "grasp_and_place_inside":
-            if spec.target_name is None:
-                raise ValueError(f"Task '{self.task_name}' requires a target_name for place-inside execution.")
-            return GraspAndPlaceInsideTask(
-                object_name=spec.object_name,
-                target_name=spec.target_name,
-                backend=self._backend,
+        """Auto-decompose the task from BDDL goal conditions."""
+        behavior_task = getattr(self.context.env, "task", None)
+        if behavior_task is None or not hasattr(behavior_task, "compiled_task"):
+            raise ValueError(
+                f"Task '{self.task_name}' environment has no BehaviorTask with compiled BDDL "
+                "conditions. Ensure initialize_activity() was called."
             )
-        raise ValueError(f"Unsupported task_primitives expert task_type: {spec.task_type}")
+        steps = plan_from_goal(behavior_task)
+        if not steps:
+            raise ValueError(
+                f"BDDL decomposition for task '{self.task_name}' produced no actionable steps. "
+                "The task's goal predicates may not be supported by the current primitive set."
+            )
+        logging.info(f"Auto-decomposed '{self.task_name}' into {len(steps)} primitive steps from BDDL goals")
+        return BDDLSequenceTask(steps=steps, backend=self._backend)
 
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
         if self.context is None:
@@ -204,13 +193,6 @@ class TaskPrimitivesExpertPolicy:
             return self._last_action
         if self._action_iter is None:
             self._task = self._build_task()
-            try:
-                obj = self.context.scene.object_registry("name", self._task.object_name)
-                if obj is not None:
-                    # Emit one debug snapshot up front so failures are easier to interpret.
-                    report_grasp_debug_context(self.context, obj, max_samples=self.max_samples)
-            except Exception:
-                pass
             self._action_iter = self._task.iter_actions(self.context)
         try:
             self._last_position_action = self._normalize_action_dim(next(self._action_iter).detach().cpu())

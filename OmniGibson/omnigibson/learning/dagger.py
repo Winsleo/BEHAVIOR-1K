@@ -20,15 +20,14 @@ from omnigibson.utils.geometry_utils import wrap_angle
 from omnigibson.learning.task_primitives import (
     CustomGraspBackend,
     FallbackGraspBackend,
-    GraspAndPlaceInsideTask,
     GraspExecutionConfig,
-    NavigateAndGraspTask,
     PrimitiveGraspBackend,
     create_action_context,
     report_grasp_debug_context,
     shutdown_simulation,
 )
-from omnigibson.learning.task_primitives.registry import resolve_task_spec
+from omnigibson.learning.task_primitives.bddl_task_planner import plan_from_goal
+from omnigibson.learning.task_primitives.tasks import BDDLSequenceTask
 from omnigibson.learning.task_primitives.runtime import (
     apply_low_res_rgb,
     get_eval_instance_ids,
@@ -62,8 +61,8 @@ def parse_args():
         default=None,
         help="Comma-separated list of instance IDs to evaluate",
     )
-    parser.add_argument("--object_name", type=str, default=None, help="Name of object to grasp (overrides registry)")
-    parser.add_argument("--target_name", type=str, default=None, help="Name of target for place-inside tasks")
+    parser.add_argument("--object_name", type=str, default=None, help="(Unused) Kept for backwards compatibility")
+    parser.add_argument("--target_name", type=str, default=None, help="(Unused) Kept for backwards compatibility")
     parser.add_argument(
         "--output_path",
         type=str,
@@ -246,9 +245,6 @@ def main():
             eval_instance_ids=parse_eval_instance_ids(args.eval_instance_ids),
         )
         print(f"Will run {len(instance_ids)} instance(s): {instance_ids}")
-
-        # --- Resolve task spec ---
-        spec = resolve_task_spec(task_name, object_name=args.object_name, target_name=args.target_name)
         backend = BACKEND_FACTORIES[args.grasp_mode]()
 
         config = GraspExecutionConfig(
@@ -288,23 +284,13 @@ def main():
                     curobo_batch_size=1,
                 )
 
-                # Debug snapshot
-                obj_name = args.object_name or spec.object_name
-                obj = context.scene.object_registry("name", obj_name)
-                if obj is not None:
-                    report_grasp_debug_context(context, obj, max_samples=args.max_samples)
-
-                # Build and run task
-                if spec.task_type == "navigate_and_grasp":
-                    task = NavigateAndGraspTask(object_name=spec.object_name, backend=backend)
-                elif spec.task_type == "grasp_and_place_inside":
-                    task = GraspAndPlaceInsideTask(
-                        object_name=spec.object_name,
-                        target_name=spec.target_name,
-                        backend=backend,
-                    )
-                else:
-                    raise ValueError(f"Unsupported task type: {spec.task_type}")
+                # Auto-decompose from BDDL goal conditions
+                steps = plan_from_goal(wrapped_env.env.task)
+                if not steps:
+                    print(f"  BDDL decomposition produced no actionable steps, skipping")
+                    continue
+                print(f"  Auto-decomposed into {len(steps)} primitive steps from BDDL goals")
+                task = BDDLSequenceTask(steps=steps, backend=backend)
 
                 result = task.run(context)
 
