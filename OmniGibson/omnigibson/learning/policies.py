@@ -2,10 +2,8 @@ import logging
 import torch as th
 from omnigibson.action_primitives.action_primitive_set_base import ActionPrimitiveError, ActionPrimitiveErrorGroup
 from omnigibson.learning.task_primitives import (
-    CustomGraspBackend,
-    FallbackGraspBackend,
     GraspExecutionConfig,
-    PrimitiveGraspBackend,
+    UnifiedGraspBackend,
     create_action_context,
 )
 from omnigibson.learning.task_primitives.bddl_task_planner import plan_from_goal
@@ -24,14 +22,14 @@ __all__ = [
 
 
 def _make_grasp_backend(grasp_mode: str):
-    """Map the config string to the backend implementation used by the expert policy."""
-    if grasp_mode == "custom":
-        return CustomGraspBackend()
-    if grasp_mode == "primitive":
-        return PrimitiveGraspBackend()
-    if grasp_mode == "both":
-        return FallbackGraspBackend(CustomGraspBackend(), PrimitiveGraspBackend())
-    raise ValueError(f"Unsupported grasp_mode: {grasp_mode}")
+    """Return the unified backend.
+
+    ``grasp_mode`` is accepted for backwards compatibility with older configs
+    (``custom`` / ``primitive`` / ``both``) but ignored — the unified backend
+    already contains the explicit pipeline and the apply_ref fallback, so every
+    mode resolves to the same implementation.
+    """
+    return UnifiedGraspBackend()
 
 
 class LocalPolicy:

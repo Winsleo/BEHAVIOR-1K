@@ -4,22 +4,15 @@ import csv
 import json
 import os
 import time
-from pathlib import Path
 from typing import Optional
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 import torch as th
 
-from gello.utils.og_teleop_cfg import DISABLED_TRANSITION_RULES
-from gello.utils.og_teleop_utils import load_available_tasks
-from omnigibson.learning.task_primitives.context import GraspExecutionConfig, create_action_context
 from omnigibson.learning.task_primitives.models import DEFAULT_IMAGE_SIZE, NUM_EVAL_INSTANCES
-from omnigibson.learning.utils.robot_config_utils import (
-    build_r1pro_primitives_robot_config,
-    resolve_presampled_robot_pose,
-)
-from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES, generate_basic_environment_config
+from omnigibson.learning.utils.robot_config_utils import resolve_presampled_robot_pose
+from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
 from omnigibson.macros import gm
 from omnigibson.utils.asset_utils import get_task_instance_path
 from omnigibson.utils.bddl_utils import is_system_bddl_inst
@@ -126,35 +119,6 @@ def load_task_instance(env, robot, instance_id: int, test_hidden: bool = False) 
     env.scene.reset()
 
 
-def load_env(task_name: str = "turning_on_radio", headless: bool = False):
-    """Create a standalone environment configured the same way as the expert runtime."""
-    for rule in DISABLED_TRANSITION_RULES:
-        rule.ENABLED = False
-    available_tasks = load_available_tasks()
-    assert task_name in available_tasks, f"Got invalid task name: {task_name}"
-    task_idx = TASK_NAMES_TO_INDICES[task_name]
-    human_stats = {"length": []}
-    episodes_path = os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl")
-    if os.path.exists(episodes_path):
-        with open(episodes_path, "r") as file:
-            episodes = [json.loads(line) for line in file]
-        for episode in episodes:
-            if episode["episode_index"] // 1e4 == task_idx:
-                human_stats["length"].append(episode["length"])
-    avg_length = sum(human_stats["length"]) / len(human_stats["length"]) if human_stats["length"] else 2500
-    task_cfg = available_tasks[task_name][0]
-    cfg = generate_basic_environment_config(task_name=task_name, task_cfg=task_cfg)
-    # Reuse the same robot config builder as eval so both entrypoints stay behaviorally aligned.
-    cfg["robots"] = [build_r1pro_primitives_robot_config(task_cfg)]
-    cfg["task"]["termination_config"]["max_steps"] = int(avg_length * 2)
-    cfg["task"]["include_obs"] = False
-    gm.HEADLESS = headless
-    print(f"Loading environment for task: {task_name}")
-    env = og.Environment(configs=cfg)
-    apply_low_res_rgb(env=env, image_size=DEFAULT_IMAGE_SIZE)
-    return env
-
-
 def resolve_scene_object(scene, object_name: str, task=None):
     if task is not None and object_name in task.object_scope:
         return task.object_scope[object_name]
@@ -167,19 +131,6 @@ def resolve_scene_object(scene, object_name: str, task=None):
 def warmup_environment(step_count: int = 30) -> None:
     for _ in range(step_count):
         og.sim.step()
-
-
-def build_grasp_context(task_name: str, headless: bool, eval_instance_ids: Optional[list[int]], config: GraspExecutionConfig):
-    """Create a ready-to-run ActionContext for a chosen task instance."""
-    env = load_env(task_name=task_name, headless=headless)
-    robot = env.robots[0]
-    instance_ids = get_eval_instance_ids(task_name=task_name, eval_instance_ids=eval_instance_ids)
-    if instance_ids:
-        instance_id = instance_ids[0]
-        load_task_instance(env=env, robot=robot, instance_id=instance_id, test_hidden=False)
-    set_viewer_camera_to_robot(env)
-    warmup_environment()
-    return create_action_context(env=env, config=config, enable_head_tracking=False, curobo_batch_size=1)
 
 
 def shutdown_simulation(delay_seconds: float = 5.0) -> None:

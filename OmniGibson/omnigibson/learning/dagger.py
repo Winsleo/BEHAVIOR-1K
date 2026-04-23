@@ -18,10 +18,8 @@ from omnigibson.controllers import ControllerView, JointController, HolonomicBas
 from omnigibson.envs.lerobot_data_wrapper import LeRobotDataWrapper
 from omnigibson.utils.geometry_utils import wrap_angle
 from omnigibson.learning.task_primitives import (
-    CustomGraspBackend,
-    FallbackGraspBackend,
     GraspExecutionConfig,
-    PrimitiveGraspBackend,
+    UnifiedGraspBackend,
     create_action_context,
     report_grasp_debug_context,
     shutdown_simulation,
@@ -42,13 +40,6 @@ from omnigibson.learning.utils.eval_utils import (
 )
 from omnigibson.learning.utils.robot_config_utils import build_r1pro_primitives_robot_config
 from omnigibson.macros import gm
-
-
-BACKEND_FACTORIES = {
-    "custom": lambda: CustomGraspBackend(),
-    "primitive": lambda: PrimitiveGraspBackend(),
-    "both": lambda: FallbackGraspBackend(CustomGraspBackend(), PrimitiveGraspBackend()),
-}
 
 
 def parse_args():
@@ -82,17 +73,10 @@ def parse_args():
         help="Maximum sampling attempts for pose near object",
     )
     parser.add_argument(
-        "--grasp_mode",
-        type=str,
-        choices=["custom", "primitive", "both"],
-        default="custom",
-        help="Grasp execution mode backend",
-    )
-    parser.add_argument(
         "--primitive_attempts",
         type=int,
         default=5,
-        help="Number of retries for the built-in GRASP primitive backend",
+        help="Retry budget — split between the explicit pipeline and the apply_ref fallback",
     )
     return parser.parse_args()
 
@@ -245,7 +229,7 @@ def main():
             eval_instance_ids=parse_eval_instance_ids(args.eval_instance_ids),
         )
         print(f"Will run {len(instance_ids)} instance(s): {instance_ids}")
-        backend = BACKEND_FACTORIES[args.grasp_mode]()
+        backend = UnifiedGraspBackend()
 
         config = GraspExecutionConfig(
             max_samples=args.max_samples,
@@ -290,6 +274,9 @@ def main():
                     print(f"  BDDL decomposition produced no actionable steps, skipping")
                     continue
                 print(f"  Auto-decomposed into {len(steps)} primitive steps from BDDL goals")
+                for step_idx, step in enumerate(steps, start=1):
+                    target_str = f" -> {step.target_name}" if step.target_name else ""
+                    print(f"    {step_idx}. {step.action.name}({step.object_name}{target_str})")
                 task = BDDLSequenceTask(steps=steps, backend=backend)
 
                 result = task.run(context)
