@@ -33,6 +33,12 @@ def apply_low_res_rgb(env, image_size: int = DEFAULT_IMAGE_SIZE) -> None:
         if hasattr(sensor, "image_height") and hasattr(sensor, "image_width"):
             sensor.image_height = image_size
             sensor.image_width = image_size
+    # Refresh physics sim views before reloading the observation space.
+    # After Environment.__init__() completes, the physics sim view can become
+    # stale (e.g. from scene.reset() during env.reset()). If the robot uses
+    # proprio observations, load_observation_space() will query joint positions
+    # which requires a valid physics sim view.
+    og.sim.update_handles()
     env.load_observation_space()
 
 
