@@ -206,7 +206,6 @@ def create_joint(
         # Possibly exclude this joint from the articulation
         joint_prim.GetAttribute("physics:excludeFromArticulation").Set(exclude_from_articulation)
 
-    # Update handles to include the new joint
     og.sim.update_handles()
 
     # Return this joint
@@ -1780,8 +1779,6 @@ class ControllableObjectViewAPI:
 
     @classmethod
     def initialize_view(cls):
-        cls._VIEWS_BY_PATTERN = {}
-
         # First, get all of the controllable objects in the scene (avoiding circular import)
         from omnigibson.robots import Robot
 
@@ -1793,12 +1790,28 @@ class ControllableObjectViewAPI:
         # Group the prim paths by robot type
         patterns = {get_robot_kinematic_tree_pattern(prim_path) for prim_path in expected_prim_paths}
 
-        # Create the view for each robot type / fixedness combo
+        # Drop views whose pattern is no longer needed (robot removed from scene).
+        # IMPORTANT: we do not wipe cls._VIEWS_BY_PATTERN wholesale here. If this is called
+        # mid-physics-step (e.g. from create_joint() during assisted grasp establishment,
+        # which runs inside _on_pre_physics_step between ControllerView.step_all() and
+        # ControllableObjectViewAPI.flush_control()), destroying the existing views would
+        # throw away _read_cache / _write_idx_cache that holds the controllers' pending
+        # DOF targets, causing flush_control() to write nothing for that step. Since
+        # assisted-grasp joints are created with exclude_from_articulation=True, the robot's
+        # articulation topology (and therefore DOF indexing) does not change across the
+        # refresh, so preserving the caches is safe.
+        for pattern in list(cls._VIEWS_BY_PATTERN.keys()):
+            if pattern not in patterns:
+                del cls._VIEWS_BY_PATTERN[pattern]
+
+        # Create the view for each robot type / fixedness combo (only for new patterns)
         for pattern in patterns:
             if pattern not in cls._VIEWS_BY_PATTERN:
                 cls._VIEWS_BY_PATTERN[pattern] = BatchControlViewAPIImpl(pattern)
 
-        # Initialize the views
+        # Initialize the views. Existing views get their underlying articulation view
+        # refreshed in-place; _read_cache and _write_idx_cache are left intact so any
+        # pending controller writes survive a mid-step update_handles().
         for view in cls._VIEWS_BY_PATTERN.values():
             view.initialize_view()
 
