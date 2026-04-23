@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from omnigibson.action_primitives.starter_semantic_action_primitives import StarterSemanticActionPrimitives
+from omnigibson.learning.task_primitives.bddl_action_primitives import BDDLSemanticActionPrimitives
 
 from omnigibson.learning.task_primitives.models import DEFAULT_MAX_SAMPLES
 from omnigibson.learning.task_primitives.observers import ConsoleObserver, NullObserver
@@ -41,7 +42,7 @@ def create_action_context(
     """Construct the primitive controller once and share it across all task steps."""
     robot = env.robots[0]
     scene = env.scene
-    controller = StarterSemanticActionPrimitives(
+    controller = BDDLSemanticActionPrimitives(
         env,
         robot,
         enable_head_tracking=enable_head_tracking,
