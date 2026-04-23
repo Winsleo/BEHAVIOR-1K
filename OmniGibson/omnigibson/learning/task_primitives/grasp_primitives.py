@@ -8,6 +8,8 @@ from typing import Dict, Generator, List, Optional, Tuple
 from omnigibson.action_primitives.action_primitive_set_base import ActionPrimitiveError
 from omnigibson.action_primitives.curobo import CuRoboEmbodimentSelection
 from omnigibson.learning.task_primitives.models import (
+    DEFAULT_MIN_RADIUS,
+    DEFAULT_MAX_SAMPLES,
     DEFAULT_SAMPLING_RADIUS,
     GraspBasePoseResult,
     GraspDebugSnapshot,
@@ -23,10 +25,6 @@ from omnigibson.learning.task_primitives.observers import build_grasp_debug_snap
 from omnigibson.utils.geometry_utils import wrap_angle
 
 
-def report_sampling_diagnostics(observer, stats: Dict[str, int]) -> None:
-    observer.report_sampling_diagnostics(stats)
-
-
 def report_grasp_debug_context(context, obj, max_samples: int) -> GraspDebugSnapshot:
     snapshot = build_grasp_debug_snapshot(context, obj, max_samples)
     context.observer.report_grasp_debug_snapshot(snapshot)
@@ -40,10 +38,6 @@ def execute_controller(ctrl_gen, env):
 
 def iterate_navigation_trajectory(context, q_traj) -> Generator[th.Tensor, None, None]:
     yield from context.controller._execute_motion_plan(q_traj, low_precision=True)
-
-
-def iterate_move_hand_to_pose(context, pose, **kwargs) -> Generator[th.Tensor, None, None]:
-    yield from context.controller._move_hand(pose, **kwargs)
 
 
 def iterate_restore_trunk_actions(context) -> Generator[th.Tensor, None, None]:
@@ -62,15 +56,6 @@ def iterate_restore_trunk_actions(context) -> Generator[th.Tensor, None, None]:
         ignore_failure=True,
         low_precision=True,
     )
-
-
-def iterate_grasp_actions(context, obj, pregrasp_pose, grasp_pose) -> Generator[th.Tensor, None, None]:
-    yield from iterate_move_hand_to_pose(context, pregrasp_pose)
-    yield from context.controller._execute_release()
-    yield from iterate_move_hand_to_pose(context, grasp_pose, ignore_objects=[obj], low_precision=True)
-    yield from context.controller._execute_grasp()
-    if context.robot.is_articulated_trunk:
-        yield from iterate_restore_trunk_actions(context)
 
 
 def generate_candidate_poses(
@@ -300,6 +285,7 @@ def select_optimal_pose(valid_poses, target_xy, robot_xy, robot_yaw, controller,
         observer.log("  Stage 2: Evaluating trajectory complexity...")
     best_pose = None
     best_idx = None
+    best_traj = None
     best_traj_score = float("inf")
     best_traj_info = None
     for i, (pose_2d, global_idx, _) in enumerate(top_k_poses):
@@ -323,13 +309,15 @@ def select_optimal_pose(valid_poses, target_xy, robot_xy, robot_yaw, controller,
             best_traj_score = traj_score
             best_pose = pose_2d
             best_idx = global_idx
+            best_traj = q_traj
             best_traj_info = (path_length, cumulative_rotation, len(q_traj))
     if best_pose is None:
         if verbose:
             observer.log("  Warning: All trajectory planning failed, using heuristic best")
         best_pose, best_idx, _ = top_k_poses[0]
+        best_traj = None
         best_traj_info = None
-    return best_pose, best_idx, best_traj_info
+    return best_pose, best_idx, best_traj, best_traj_info
 
 
 def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, sampling_radius=DEFAULT_SAMPLING_RADIUS, verbose=True, visualize=False, seed=42):
@@ -373,6 +361,7 @@ def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, samplin
         num_samples=max_samples,
         sampling_radius=sampling_radius,
         arm_workspace_offset=avg_arm_workspace_range.item(),
+        min_radius=DEFAULT_MIN_RADIUS,
     )
     room_valid_poses, room_valid_indices = filter_poses_by_room(candidate_poses, obj_rooms, robot.scene._seg_map)
     stats["room_failures"] = max_samples - len(room_valid_indices)
@@ -382,7 +371,7 @@ def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, samplin
         stats["total_attempts"] = max_samples
         if verbose:
             observer.log("\n  [FAILED] All samples failed room check")
-            report_sampling_diagnostics(observer, stats)
+            observer.report_sampling_diagnostics(stats)
         return GraspBasePoseResult(None, None, None, False, stats)
 
     current_joint_pos = robot.get_joint_positions()
@@ -404,7 +393,7 @@ def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, samplin
         stats["total_attempts"] = max_samples
         if verbose:
             observer.log("\n  [FAILED] All samples failed collision check")
-            report_sampling_diagnostics(observer, stats)
+            observer.report_sampling_diagnostics(stats)
         if visualize:
             observer.show_candidate_poses(
                 True,
@@ -437,11 +426,13 @@ def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, samplin
         robot_pos, robot_quat = robot.get_position_orientation()
         robot_xy = robot_pos[:2]
         robot_yaw = T.quat2euler(robot_quat)[2].item()
-        best_pose, _, _ = select_optimal_pose(valid_poses, target_xy, robot_xy, robot_yaw, controller, robot, observer=observer, verbose=verbose)
+        best_pose, _, best_traj, _ = select_optimal_pose(
+            valid_poses, target_xy, robot_xy, robot_yaw, controller, robot, observer=observer, verbose=verbose
+        )
         stats["total_attempts"] = max_samples
         if verbose:
             observer.log("\n  [SUCCESS] Selected optimal pose based on trajectory complexity")
-            report_sampling_diagnostics(observer, stats)
+            observer.report_sampling_diagnostics(stats)
         if visualize:
             observer.show_candidate_poses(
                 True,
@@ -458,12 +449,12 @@ def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, samplin
                 False,
                 MAX_VERBOSE_SAMPLES,
             )
-        return GraspBasePoseResult(eef_pose, grasp_pose, best_pose, True, stats)
+        return GraspBasePoseResult(eef_pose, grasp_pose, best_pose, True, stats, q_traj=best_traj)
 
     stats["total_attempts"] = max_samples
     if verbose:
         observer.log(f"\n  [FAILED] No valid pose found after {max_samples} attempts")
-        report_sampling_diagnostics(observer, stats)
+        observer.report_sampling_diagnostics(stats)
     if visualize:
         observer.show_candidate_poses(
             True,
@@ -483,42 +474,140 @@ def find_optimal_grasp_base_pose(controller, obj, max_samples, observer, samplin
     return GraspBasePoseResult(None, None, None, False, stats)
 
 
-def execute_navigation_trajectory(context, q_traj, verbose=True) -> None:
-    if verbose:
-        context.observer.section(f"[Step 3/5] Executing navigation ({len(q_traj)} waypoints)")
-    for action in iterate_navigation_trajectory(context, q_traj):
-        context.step(action)
-    if verbose:
-        context.observer.log("[OK] Navigation complete")
+def find_optimal_base_pose(
+    controller,
+    target_eef_pose,
+    obj,
+    max_samples: int = DEFAULT_MAX_SAMPLES,
+    sampling_radius: float = DEFAULT_SAMPLING_RADIUS,
+    plan_with_open_gripper: bool = False,
+    skip_obstacle_update: bool = False,
+    max_rounds: int = 3,
+    min_radius: float = DEFAULT_MIN_RADIUS,
+    seed: int = 42,
+    return_traj: bool = False,
+):
+    """Find an optimal base pose near *target_eef_pose* using multi-round sampling.
 
+    Round 0 uses a Fibonacci spiral for uniform coverage; subsequent rounds
+    use random sampling with an increased sample count and a different seed
+    for diversity.  Each round filters by room → collision → reachability,
+    scores surviving candidates heuristically, and pre-validates navigation
+    on the top-K before returning.
 
-def move_hand_to_pose(context, pose, verbose_header: Optional[str] = None, **kwargs) -> None:
-    if verbose_header:
-        context.observer.section(verbose_header)
-    for action in iterate_move_hand_to_pose(context, pose, **kwargs):
-        context.step(action)
+    Args:
+        return_traj: If True, also return the navigation trajectory validated
+            during pre-validation.  curobo's planner is stochastic, so reusing
+            this trajectory avoids the risk of a failing second plan on the
+            same inputs.  Default False preserves the original signature.
 
+    Returns:
+        If return_traj is False: a (x, y, yaw) tensor, or None.
+        If return_traj is True: a tuple (pose, q_traj), or (None, None).
+    """
+    robot = controller.robot
+    arm = controller.arm
+    target_xy = target_eef_pose[0][:2]
+    obj_rooms = (
+        obj.in_rooms
+        if obj.in_rooms
+        else [robot.scene._seg_map.get_room_instance_by_point(target_xy)]
+    )
+    avg_arm_workspace_range = th.mean(robot.arm_workspace_range[arm])
 
-def execute_grasp_motion(context, obj, pregrasp_pose, grasp_pose, verbose=True) -> None:
-    move_hand_to_pose(context, pregrasp_pose, verbose_header="[Step 4/5] Moving hand to pre-grasp position")
-    if verbose:
-        context.observer.log("[OK] Hand at pre-grasp position")
-        context.observer.section("[Step 5/5] Executing grasp")
-    for action in context.controller._execute_release():
-        context.step(action)
-    for action in iterate_move_hand_to_pose(context, grasp_pose, ignore_objects=[obj], low_precision=True):
-        context.step(action)
-    for action in context.controller._execute_grasp():
-        context.step(action)
+    if not skip_obstacle_update:
+        controller._motion_generator.update_obstacles()
 
+    if plan_with_open_gripper:
+        current_joint_pos = controller._get_joint_position_with_fingers_at_limit("upper")
+    else:
+        current_joint_pos = robot.get_joint_positions()
 
-def restore_trunk(context, verbose=True) -> None:
-    robot = context.robot
-    if not robot.is_articulated_trunk:
-        return
-    if verbose:
-        context.observer.section("[Step 6/6] Restoring trunk to initial pose")
-    for action in iterate_restore_trunk_actions(context):
-        context.step(action)
-    if verbose:
-        context.observer.log("[OK] Stand up complete")
+    obj_in_hand = controller._get_obj_in_hand()
+    attached_obj = (
+        {robot.eef_link_names[arm]: obj_in_hand.root_link} if obj_in_hand else None
+    )
+
+    robot_pos, robot_quat = robot.get_position_orientation()
+    robot_xy = robot_pos[:2]
+    robot_yaw = T.quat2euler(robot_quat)[2].item()
+
+    for round_idx in range(max_rounds):
+        n = max_samples * (round_idx + 1)
+        strategy = (
+            SamplingStrategy.FIBONACCI_SPIRAL
+            if round_idx == 0
+            else SamplingStrategy.RANDOM
+        )
+        th.manual_seed(seed + round_idx * 1000)
+
+        candidates = generate_candidate_poses(
+            target_pos=target_eef_pose[0],
+            num_samples=n,
+            sampling_radius=sampling_radius,
+            arm_workspace_offset=avg_arm_workspace_range.item(),
+            min_radius=min_radius,
+            strategy=strategy,
+        )
+
+        # ---- Room filter ----
+        room_valid, room_indices = filter_poses_by_room(
+            candidates, obj_rooms, robot.scene._seg_map
+        )
+        if len(room_indices) == 0:
+            continue
+
+        # ---- Batch collision check ----
+        batch_jp = convert_poses_to_joint_positions(
+            room_valid, robot, current_joint_pos
+        )
+        collision_results = batch_collision_check(controller, batch_jp, attached_obj)
+        collision_free = th.where(~collision_results)[0]
+        if len(collision_free) == 0:
+            continue
+
+        # ---- Reachability check ----
+        valid_poses: List[th.Tensor] = []
+        for idx in collision_free:
+            jp = batch_jp[idx]
+            if controller._target_in_reach_of_robot(
+                target_eef_pose,
+                initial_joint_pos=jp,
+                skip_obstacle_update=True,
+            ):
+                valid_poses.append(room_valid[idx])
+        if not valid_poses:
+            continue
+
+        # ---- Heuristic scoring ----
+        scored = sorted(
+            valid_poses,
+            key=lambda p: compute_heuristic_score(
+                p, target_xy, robot_xy, robot_yaw
+            ),
+        )
+
+        # ---- Navigation pre-validation on top candidates ----
+        top_k = min(TOP_K_CANDIDATES + 2, len(scored))
+        for pose in scored[:top_k]:
+            q_traj = plan_navigation(
+                controller=controller,
+                robot=robot,
+                target_pose_2d=pose,
+                verbose=False,
+            )
+            if q_traj is not None:
+                return (pose, q_traj) if return_traj else pose
+
+        # Try remaining candidates
+        for pose in scored[top_k:]:
+            q_traj = plan_navigation(
+                controller=controller,
+                robot=robot,
+                target_pose_2d=pose,
+                verbose=False,
+            )
+            if q_traj is not None:
+                return (pose, q_traj) if return_traj else pose
+
+    return (None, None) if return_traj else None

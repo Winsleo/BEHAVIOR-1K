@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 NUM_EVAL_INSTANCES = 10
 DEFAULT_SAMPLING_RADIUS = 1.5
-DEFAULT_MAX_SAMPLES = 30
+DEFAULT_MAX_SAMPLES = 60
+DEFAULT_MIN_RADIUS = 0.15
 DEFAULT_IMAGE_SIZE = 224
 MAX_VERBOSE_SAMPLES = 20
 
@@ -42,6 +43,11 @@ class GraspBasePoseResult:
     base_pose_2d: Optional[th.Tensor]
     success: bool
     stats: Dict[str, int]
+    # The navigation trajectory validated during base-pose selection, reused
+    # directly by the unified backend so curobo's stochastic planner is invoked
+    # exactly once per grasp attempt.  None when sampling failed or when no
+    # trajectory survived validation.
+    q_traj: Optional[th.Tensor] = None
 
 
 @dataclass
